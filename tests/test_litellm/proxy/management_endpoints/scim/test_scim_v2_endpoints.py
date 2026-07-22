@@ -1,3 +1,4 @@
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -2878,6 +2879,19 @@ async def test_patch_group_rename_recomputes_retained_members(mocker):
 )
 def test_extract_ids_from_path_filter(path, attribute, expected):
     assert _extract_ids_from_path_filter(path, attribute) == expected
+
+
+def test_extract_ids_from_path_filter_unterminated_is_linear():
+    """A pathological unterminated quoted filter must not trigger super-linear
+    backtracking; it returns no id and completes near-instantly."""
+    pathological = 'members[value eq "' + ("\\" * 200)
+
+    start = time.perf_counter()
+    result = _extract_ids_from_path_filter(pathological, "members")
+    elapsed = time.perf_counter() - start
+
+    assert result == []
+    assert elapsed < 1.0
 
 
 @pytest.mark.asyncio

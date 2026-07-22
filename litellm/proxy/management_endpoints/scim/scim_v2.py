@@ -1341,7 +1341,7 @@ def _extract_ids_from_path_filter(path: str | None, attribute: str) -> List[str]
     if not path:
         return []
     match = re.match(
-        rf"""\s*{re.escape(attribute)}\s*\[\s*value\s+eq\s+(?:(['"])((?:\\.|(?!\1).)*)\1|([^\]\s]+))\s*\]\s*$""",
+        rf"""\s*{re.escape(attribute)}\s*\[\s*value\s+eq\s+(?:(['"])((?:\\.|[^\\])*?)\1|([^\]\s]+))\s*\]\s*$""",
         path,
         flags=re.IGNORECASE,
     )
