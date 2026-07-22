@@ -171,6 +171,15 @@ class MCPCredentials(TypedDict, total=False):
     Optional RFC 8707 resource indicator sent on ID-JAG leg 1
     """
 
+    upstream_resource: str | None
+    """
+    Optional RFC 8707 resource indicator sent on the upstream oauth2 legs (authorize, both token
+    grants, and the client_credentials fetch). Omitted when unset, which is the default; "auto"
+    derives the canonical URI from the server's url; any other value is sent verbatim.
+    Distinct from ``id_jag_resource``, which is the same parameter on the ID-JAG exchange, and from
+    ``audience``, which is the RFC 8693 token-exchange parameter.
+    """
+
     client_private_key: Optional[str]
     """
     PEM private key used to sign the private-key-JWT client_assertion (RFC 7523)

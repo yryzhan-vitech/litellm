@@ -1412,6 +1412,7 @@ class MCPServerManager:
                     "subject_token_type",
                     DEFAULT_SUBJECT_TOKEN_TYPE,
                 ),
+                upstream_resource=server_config.get("upstream_resource", None),
                 # ID-JAG fields
                 id_jag_resource_token_endpoint=server_config.get("id_jag_resource_token_endpoint", None),
                 id_jag_resource=server_config.get("id_jag_resource", None),
@@ -1895,6 +1896,7 @@ class MCPServerManager:
             subject_token_type=mcp_server.subject_token_type
             or (credentials_dict.get("subject_token_type") if credentials_dict else None)
             or DEFAULT_SUBJECT_TOKEN_TYPE,
+            upstream_resource=(credentials_dict.get("upstream_resource") if credentials_dict else None),
             # ID-JAG fields — read from credentials JSON blob
             id_jag_resource_token_endpoint=(
                 credentials_dict.get("id_jag_resource_token_endpoint") if credentials_dict else None

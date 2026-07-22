@@ -3,13 +3,16 @@
 
 import os
 from ipaddress import ip_address
-from typing import Any, Dict, List, NoReturn, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional
 from urllib.parse import ParseResult, urlparse, urlunparse
 
 from fastapi import HTTPException, Request
 
 from litellm._logging import verbose_logger
 from litellm.proxy.auth.ip_address_utils import IPAddressUtils
+
+if TYPE_CHECKING:
+    from litellm.types.mcp_server.mcp_server_manager import MCPServer
 
 # RFC 6749 §5.1 / OAuth 2.1 draft-15 §4.1.3: token-endpoint responses
 # must not be cached — both success and error bodies may reveal secrets.
@@ -20,6 +23,10 @@ TOKEN_NO_CACHE_HEADERS = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 # routinely set X-Forwarded-Port: 443 even when the client URL has no
 # explicit port, which would otherwise break a literal netloc compare).
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# Sentinel ``upstream_resource`` value meaning "derive the RFC 8707 resource identifier from the
+# server's own url". RFC 8707 requires an absolute URI, so this can never be a real resource value.
+UPSTREAM_RESOURCE_AUTO = "auto"
 
 # Env var for ops to allowlist additional redirect_uri origins beyond
 # same-origin + loopback — needed for first-party OAuth clients hosted
@@ -529,3 +536,81 @@ def validate_trusted_redirect_uri(request: Request, redirect_uri: str) -> None:
     if _trusted_redirect_uri_is_allowed(parsed, redirect_netloc, proxy_base):
         return
     _raise_trusted_redirect_uri_rejected(request, redirect_uri, parsed, redirect_netloc, proxy_base)
+
+
+def _canonical_resource_uri(url: str) -> str | None:
+    """Canonicalize an upstream MCP server URL into an RFC 8707 resource identifier.
+
+    Keeps only the scheme, host, port and path, which is the shape the MCP authorization spec's
+    "Canonical Server URI" section describes and every one of its examples takes. The scheme and
+    host are lowercased, and a trailing slash is dropped so ``https://host/mcp/`` and
+    ``https://host/mcp`` never present as two different resources.
+
+    Userinfo, query and fragment are dropped rather than carried. A transport URL routinely holds
+    credentials in exactly those components (``user:password@``, ``?api_key=``), while a resource
+    indicator names the resource and nothing else; this value is published somewhere the transport
+    URL never goes, into the authorization redirect the browser follows and into token request
+    bodies, so carrying them would disclose them to the authorization server, its logs, and browser
+    history. RFC 8707 forbids a fragment outright and says a resource SHOULD NOT carry a query. An
+    upstream whose identifier genuinely needs more than this is served by setting
+    ``upstream_resource`` explicitly, which is passed through untouched.
+
+    Returns ``None`` when the URL is not absolute, which cannot yield a valid resource identifier.
+    """
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    host_and_port = parsed.netloc.rpartition("@")[2]
+    return urlunparse(
+        parsed._replace(
+            scheme=parsed.scheme.lower(),
+            netloc=host_and_port.lower(),
+            path=parsed.path.rstrip("/"),
+            params="",
+            query="",
+            fragment="",
+        )
+    )
+
+
+def resolve_upstream_resource(mcp_server: "MCPServer") -> str | None:
+    """Resolve the RFC 8707 ``resource`` value this server's upstream OAuth legs must carry.
+
+    The MCP authorization spec requires an MCP client to send ``resource`` on both the
+    authorization request and every token request, naming the canonical URI of the MCP server the
+    token is for. Authorization server temperaments are irreconcilable and undetectable, so this
+    stays an explicit per-server opt-in: most SaaS providers ignore the parameter, some hard-reject
+    it and express audience through scopes instead, and strict or MCP-native ones refuse to mint a
+    correctly scoped token without it (``invalid_target``).
+
+    ``None`` or blank omits the parameter, which is the default and preserves the behavior of every
+    server working today. ``"auto"`` derives the canonical URI from the server's own URL; it is not
+    an absolute URI, so RFC 8707 guarantees it can never collide with a real resource value. Any
+    other value is sent verbatim, because the identifier has to match what the authorization server
+    expects exactly and normalizing it could break that match.
+
+    Every upstream leg for a server resolves through this one function, so the authorize request
+    and the token requests cannot disagree; a token request naming a resource the authorization
+    request never asked for is itself an ``invalid_target`` under RFC 8707.
+    """
+    configured = (mcp_server.upstream_resource or "").strip()
+    if not configured:
+        return None
+    if configured.lower() != UPSTREAM_RESOURCE_AUTO:
+        return configured
+    if not mcp_server.url:
+        verbose_logger.warning(
+            "MCP server %s sets upstream_resource=auto but has no url to derive a resource "
+            "identifier from; omitting the RFC 8707 resource parameter. Set upstream_resource to "
+            "the exact resource identifier the authorization server expects instead.",
+            mcp_server.server_id,
+        )
+        return None
+    canonical = _canonical_resource_uri(mcp_server.url)
+    if canonical is None:
+        verbose_logger.warning(
+            "MCP server %s sets upstream_resource=auto but its url is not an absolute URI, so no "
+            "RFC 8707 resource identifier could be derived; omitting the resource parameter",
+            mcp_server.server_id,
+        )
+    return canonical

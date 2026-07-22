@@ -42,6 +42,7 @@ from litellm.proxy._experimental.mcp_server.faults import (
 from litellm.proxy._experimental.mcp_server.oauth_utils import (
     TOKEN_NO_CACHE_HEADERS,
     get_request_base_url,
+    resolve_upstream_resource,
     validate_trusted_redirect_uri,
     well_known_root_suffix,
 )
@@ -570,6 +571,7 @@ def _redirect_to_upstream_authorize(
     to the upstream authorize endpoint verbatim, no relay state cookie is set, and the upstream
     enforces its own registered redirect binding for the client."""
     scope_value = scope or (" ".join(mcp_server.scopes) if mcp_server.scopes else None)
+    upstream_resource = resolve_upstream_resource(mcp_server)
     passthrough_params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -578,6 +580,7 @@ def _redirect_to_upstream_authorize(
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
         **({"scope": scope_value} if scope_value else {}),
+        **({"resource": upstream_resource} if upstream_resource else {}),
     }
     parsed_auth_url = urlparse(mcp_server.authorization_url or "")
     merged_params = {**dict(parse_qsl(parsed_auth_url.query)), **passthrough_params}
@@ -675,6 +678,10 @@ async def authorize_with_server(
         params["code_challenge"] = code_challenge
     if code_challenge_method:
         params["code_challenge_method"] = code_challenge_method
+
+    upstream_resource = resolve_upstream_resource(mcp_server)
+    if upstream_resource:
+        params["resource"] = upstream_resource
 
     parsed_auth_url = urlparse(mcp_server.authorization_url)
     existing_params = dict(parse_qsl(parsed_auth_url.query))
@@ -814,6 +821,14 @@ async def exchange_token_with_server(
             if not isinstance(prepared, _BridgeMintReady):
                 return _bridge_mint_error_response(prepared)
             bridge_mint_ready = prepared
+
+    # RFC 8707 §2: the resource must be sent on the token request for every grant type, and it must
+    # be the one the authorization request already asked for, so both arms resolve it through the
+    # same helper the authorize leg uses.
+    upstream_resource = resolve_upstream_resource(mcp_server)
+    if upstream_resource:
+        token_data["resource"] = upstream_resource
+
     async_client = get_async_httpx_client(llm_provider=httpxSpecialProvider.Oauth2Check)
     try:
         response = await async_client.post(
