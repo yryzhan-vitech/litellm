@@ -2875,6 +2875,8 @@ async def test_patch_group_rename_recomputes_retained_members(mocker):
         ('groups[value eq "team-1"]', "members", []),
         (None, "members", []),
         ('members[value eq ""]', "members", []),
+        ("members[value eq user-1]", "members", []),
+        ("members[value eq unintendeduser]", "members", []),
     ],
 )
 def test_extract_ids_from_path_filter(path, attribute, expected):
@@ -2949,3 +2951,34 @@ async def test_process_group_patch_add_filtered_path_without_value(mocker):
     )
 
     assert final_members == {"user-1", "user-3"}
+
+
+@pytest.mark.asyncio
+async def test_process_group_patch_replace_empty_value_does_not_use_path_filter(mocker):
+    """An explicit empty replace value must clear membership rather than pull an
+    id from the filtered path, which would retain one member and drop the rest."""
+    patch_ops = SCIMPatchOp(
+        schemas=["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        Operations=[
+            SCIMPatchOperation(op="replace", path='members[value eq "user-1"]', value=[])
+        ],
+    )
+
+    existing_team = mocker.MagicMock()
+    existing_team.members = ["user-1", "user-2"]
+    existing_team.metadata = {}
+
+    prisma_client = mocker.MagicMock()
+    prisma_client.db = mocker.MagicMock()
+    prisma_client.db.litellm_usertable = mocker.MagicMock()
+    prisma_client.db.litellm_usertable.find_unique = AsyncMock(
+        return_value=LiteLLM_UserTable(user_id="user-1")
+    )
+
+    _, final_members = await _process_group_patch_operations(
+        patch_ops=patch_ops,
+        existing_team=existing_team,
+        prisma_client=prisma_client,
+    )
+
+    assert final_members == set()

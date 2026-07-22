@@ -1333,22 +1333,22 @@ def _extract_ids_from_path_filter(path: str | None, attribute: str) -> List[str]
     Okta commonly sends membership removals as a filtered path and omits the
     request body ``value``, so the id lives only inside the ``[value eq "..."]``
     filter. The ``eq`` operator is matched case-insensitively per the SCIM
-    spec; the id keeps its original case, and single or double quotes are
-    accepted. A quoted id may contain escaped quotes and backslashes
-    (``\\"`` and ``\\\\``), which are unescaped before use. ``path`` must be the
-    raw, case-preserving path from the patch op.
+    spec; the id keeps its original case. Per the SCIM filter grammar the
+    compared value must be quoted (single or double), so malformed unquoted
+    filters yield no id. A quoted id may contain escaped quotes and
+    backslashes (``\\"`` and ``\\\\``), which are unescaped before use.
+    ``path`` must be the raw, case-preserving path from the patch op.
     """
     if not path:
         return []
     match = re.match(
-        rf"""\s*{re.escape(attribute)}\s*\[\s*value\s+eq\s+(?:(['"])((?:\\.|[^\\])*?)\1|([^\]\s]+))\s*\]\s*$""",
+        rf"""\s*{re.escape(attribute)}\s*\[\s*value\s+eq\s+(['"])((?:\\.|[^\\])*?)\1\s*\]\s*$""",
         path,
         flags=re.IGNORECASE,
     )
     if not match:
         return []
-    quoted, unquoted = match.group(2), match.group(3)
-    extracted = re.sub(r"\\(.)", r"\1", quoted) if quoted is not None else (unquoted or "")
+    extracted = re.sub(r"\\(.)", r"\1", match.group(2))
     return [extracted] if extracted else []
 
 
@@ -1397,7 +1397,9 @@ def _handle_name_update(path: str, op_type: str, value: Any, scim_metadata: Dict
 
 def _handle_group_operations(op_type: str, value: Any, teams_set: Set[str], path: str | None) -> Set[str] | None:
     """Handle group/team membership operations."""
-    group_values = _extract_group_values(value) or _extract_ids_from_path_filter(path, "groups")
+    group_values = _extract_group_values(value)
+    if not group_values and value is None:
+        group_values = _extract_ids_from_path_filter(path, "groups")
     if op_type == "replace":
         return set(group_values)
     elif op_type == "add":
@@ -1932,7 +1934,9 @@ async def _process_group_patch_operations(
                 metadata["externalId"] = str(value)
         elif path.startswith("members"):
             # Handle member operations
-            member_values = _extract_group_values(value) or _extract_ids_from_path_filter(op.path, "members")
+            member_values = _extract_group_values(value)
+            if not member_values and value is None:
+                member_values = _extract_ids_from_path_filter(op.path, "members")
             # Check the feature flag
             scim_upsert_user = await _get_scim_upsert_user_setting()
             # Validate all users exist or create them based on feature flag

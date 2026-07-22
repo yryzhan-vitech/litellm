@@ -500,3 +500,23 @@ def test_apply_patch_ops_add_group_filtered_path_without_value():
     _, final_team_set = _apply_patch_ops(existing_user=user, patch_ops=patch_ops)
 
     assert final_team_set == {"team-1", "team-3"}
+
+
+def test_apply_patch_ops_replace_groups_empty_value_does_not_use_path_filter():
+    """A filtered replace with an explicit empty value must not resurrect the
+    filter id; the team set is replaced with the empty value as given."""
+    user = LiteLLM_UserTable(
+        user_id="user-fp",
+        user_email="fp@example.com",
+        teams=["team-1", "team-2"],
+        metadata={},
+    )
+    patch_ops = SCIMPatchOp(
+        Operations=[
+            SCIMPatchOperation(op="replace", path='groups[value eq "team-1"]', value=[])
+        ]
+    )
+
+    _, final_team_set = _apply_patch_ops(existing_user=user, patch_ops=patch_ops)
+
+    assert final_team_set == set()
