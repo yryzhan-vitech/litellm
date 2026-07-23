@@ -1284,13 +1284,6 @@ class AmazonConverseConfig(BaseConfig):
         additional_request_params = {k: v for k, v in inference_params.items() if k not in total_supported_params}
         inference_params = {k: v for k, v in inference_params.items() if k in total_supported_params}
 
-        # Handle parallel_tool_calls configuration
-        parallel_tool_use_config = additional_request_params.pop("_parallel_tool_use_config", None)
-        if parallel_tool_use_config is not None and bedrock_converse_supports_parallel_tool_use_config(model):
-            additional_request_params = self._merge_parallel_tool_use_config(
-                additional_request_params, parallel_tool_use_config
-            )
-
         additional_request_params.pop("parallel_tool_calls", None)
 
         # Only set the topK value in for models that support it
@@ -1569,9 +1562,21 @@ class AmazonConverseConfig(BaseConfig):
                     bedrock_tools.append(ToolBlock(cachePoint=cache_point))
                     break
 
+        # [ARC-BUG-25] gate parallel_tool_use config on post-filter bedrock_tools so toolless requests don't 400 (upstream PR #34421)
+        parallel_tool_use_config = additional_request_params.pop("_parallel_tool_use_config", None)
+        if (
+            parallel_tool_use_config is not None
+            and len(bedrock_tools) > 0
+            and bedrock_converse_supports_parallel_tool_use_config(model)
+        ):
+            additional_request_params = self._merge_parallel_tool_use_config(
+                additional_request_params, parallel_tool_use_config
+            )
+
+        # [ARC-BUG-11] pop tool_choice unconditionally so it never leaks into inferenceConfig on toolless requests (upstream PR #34421)
+        tool_choice_values: ToolChoiceValuesBlock = inference_params.pop("tool_choice", None)
         bedrock_tool_config: Optional[ToolConfigBlock] = None
         if len(bedrock_tools) > 0:
-            tool_choice_values: ToolChoiceValuesBlock = inference_params.pop("tool_choice", None)
             bedrock_tool_config = ToolConfigBlock(
                 tools=bedrock_tools,
             )
