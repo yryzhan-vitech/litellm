@@ -709,6 +709,10 @@ class AnthropicPassthroughLoggingHandler:
                             tool_search_requests = _stu.get("tool_search_requests")
                     if usage.get("cache_read_input_tokens") is not None:
                         cache_read = usage.get("cache_read_input_tokens")
+                    # [ARC-BUG-04] recover cache_creation from message_delta too
+                    # (Invoke lands cache usage on the final delta, not message_start)
+                    if usage.get("cache_creation_input_tokens") is not None:
+                        cache_creation = usage.get("cache_creation_input_tokens")
                     if usage.get("inference_geo") is not None:
                         inference_geo = usage.get("inference_geo")
                     found_usage = True
