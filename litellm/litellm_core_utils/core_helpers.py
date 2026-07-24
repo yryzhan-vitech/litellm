@@ -308,38 +308,33 @@ def safe_deep_copy(data):
     if litellm.safe_memory_mode is True:
         return data
 
-    litellm_parent_otel_span: Optional[Any] = None
-    # Step 1: Remove the litellm_parent_otel_span
-    litellm_parent_otel_span = None
-    if isinstance(data, dict):
-        # remove litellm_parent_otel_span since this is not picklable
-        if "metadata" in data and "litellm_parent_otel_span" in data["metadata"]:
-            litellm_parent_otel_span = data["metadata"].pop("litellm_parent_otel_span")
-            data["metadata"]["litellm_parent_otel_span"] = "placeholder"
-        if "litellm_metadata" in data and "litellm_parent_otel_span" in data["litellm_metadata"]:
-            litellm_parent_otel_span = data["litellm_metadata"].pop("litellm_parent_otel_span")
-            data["litellm_metadata"]["litellm_parent_otel_span"] = "placeholder"
-
-    # Step 2: Per-key deepcopy with fallback
-    if isinstance(data, dict):
-        new_data = {}
-        for k, v in data.items():
-            try:
-                new_data[k] = copy.deepcopy(v)
-            except Exception:
-                new_data[k] = v
-    else:
+    if not isinstance(data, dict):
         try:
-            new_data = copy.deepcopy(data)
+            return copy.deepcopy(data)
         except Exception:
-            new_data = data
+            return data
 
-    # Step 3: re-add the litellm_parent_otel_span after doing a deep copy
-    if isinstance(data, dict) and litellm_parent_otel_span is not None:
-        if "metadata" in data and "litellm_parent_otel_span" in data["metadata"]:
-            data["metadata"]["litellm_parent_otel_span"] = litellm_parent_otel_span
-        if "litellm_metadata" in data and "litellm_parent_otel_span" in data["litellm_metadata"]:
-            data["litellm_metadata"]["litellm_parent_otel_span"] = litellm_parent_otel_span
+    # [ARC-BUG-02] snapshot the top level AND the two known-mutable nested dicts before
+    # anything iterates them: copy.deepcopy() below walks metadata/litellm_metadata, which
+    # concurrent hooks insert into, and the span swap must not touch the caller's dicts
+    # (a reader would see "placeholder"). dict(x) is atomic under the GIL. (upstream PR #34472)
+    snapshot = dict(data)
+    for nested_key in ("metadata", "litellm_metadata"):
+        nested = snapshot.get(nested_key)
+        if isinstance(nested, dict):
+            snapshot[nested_key] = dict(nested)
+
+    for nested_key in ("metadata", "litellm_metadata"):
+        nested = snapshot.get(nested_key)
+        if isinstance(nested, dict) and "litellm_parent_otel_span" in nested:
+            nested["litellm_parent_otel_span"] = "placeholder"
+
+    new_data = {}
+    for k, v in snapshot.items():
+        try:
+            new_data[k] = copy.deepcopy(v)
+        except Exception:
+            new_data[k] = v
     return new_data
 
 
