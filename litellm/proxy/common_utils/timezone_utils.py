@@ -27,3 +27,20 @@ def get_budget_reset_time(budget_duration: str) -> datetime:
         timezone_str=get_budget_reset_timezone(),
     )
     return reset_at
+
+
+# [ARC-BUG-06] shared predicate to decide whether a budget-window (re)arm on
+# key/user/team update starts a fresh window (upstream PR #34493)
+def is_budget_window_newly_armed(
+    new_duration: "str | None",
+    existing_duration: "str | None",
+    existing_reset_at: "datetime | None",
+) -> bool:
+    if not new_duration:
+        return False
+    if existing_reset_at is None:
+        return True
+    now = datetime.now(existing_reset_at.tzinfo)
+    if existing_reset_at < now:
+        return True
+    return new_duration != existing_duration

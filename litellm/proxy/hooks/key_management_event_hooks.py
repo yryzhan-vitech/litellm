@@ -1,7 +1,7 @@
 import asyncio
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -85,6 +85,13 @@ class KeyManagementEventHooks:
         except Exception as e:
             verbose_proxy_logger.warning(f"Failed to store virtual key in secret manager: {e}")
 
+    # [ARC-BUG-06] serialize an audit payload with server-inferred writes overlaid.
+    # budget_reset_at is not declared on GenerateKeyResponse, so a rotation that arms a
+    # budget window would otherwise drop it from the audit record (upstream PR #34493)
+    @staticmethod
+    def _merge_applied_values(base: Mapping[str, Any], applied_values: Mapping[str, Any] | None) -> str:
+        return json.dumps({**base, **applied_values} if applied_values else base, default=str)
+
     @staticmethod
     async def async_key_updated_hook(
         data: UpdateKeyRequest,
@@ -92,6 +99,10 @@ class KeyManagementEventHooks:
         response: Any,
         user_api_key_dict: UserAPIKeyAuth,
         litellm_changed_by: Optional[str] = None,
+        # [ARC-BUG-06] applied_values carries server-inferred field writes (e.g. spend=0.0
+        # on a budget-window re-arm) so the audit log reflects what was persisted, not just
+        # the raw request (upstream PR #34493)
+        applied_values: Mapping[str, Any] | None = None,
     ):
         """
         Post /key/update processing hook
@@ -107,7 +118,11 @@ class KeyManagementEventHooks:
 
         # Enterprise Feature - Audit Logging. Enable with litellm.store_audit_logs = True
         if litellm.store_audit_logs is True:
-            _updated_values = json.dumps(data.json(exclude_none=True), default=str)
+            # [ARC-BUG-06] merge applied_values over the raw request so inferred writes appear in the audit trail
+            _updated_values = KeyManagementEventHooks._merge_applied_values(
+                base=data.json(exclude_none=True),
+                applied_values=applied_values,
+            )
 
             _before_value = existing_key_row.json(exclude_none=True)
             _before_value = json.dumps(_before_value, default=str)
@@ -139,6 +154,9 @@ class KeyManagementEventHooks:
         response: GenerateKeyResponse,
         user_api_key_dict: UserAPIKeyAuth,
         litellm_changed_by: Optional[str] = None,
+        # [ARC-BUG-06] /key/regenerate shares prepare_key_update_data, so a rotation can arm
+        # a budget window; budget_reset_at is absent from GenerateKeyResponse (upstream PR #34493)
+        applied_values: Mapping[str, Any] | None = None,
     ):
         from litellm.proxy.management_helpers.audit_logs import (
             create_audit_log_for_update,
@@ -194,7 +212,11 @@ class KeyManagementEventHooks:
                         table_name=LitellmTableNames.KEY_TABLE_NAME,
                         object_id=existing_key_row.token,
                         action="rotated",
-                        updated_values=response.model_dump_json(exclude_none=True),
+                        # [ARC-BUG-06] overlay the armed budget window on the response payload
+                        updated_values=KeyManagementEventHooks._merge_applied_values(
+                            base=response.model_dump(exclude_none=True),
+                            applied_values=applied_values,
+                        ),
                         before_value=existing_key_row.model_dump_json(exclude_none=True),
                     )
                 )

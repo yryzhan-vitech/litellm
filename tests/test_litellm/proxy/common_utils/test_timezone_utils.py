@@ -1,6 +1,6 @@
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 sys.path.insert(
@@ -100,3 +100,51 @@ def test_get_budget_reset_time_respects_timezone():
                 delattr(litellm, "timezone")
         else:
             litellm.timezone = original
+
+
+def test_is_budget_window_newly_armed_first_time():
+    from litellm.proxy.common_utils.timezone_utils import is_budget_window_newly_armed
+
+    assert is_budget_window_newly_armed(
+        new_duration="30d", existing_duration=None, existing_reset_at=None
+    ) is True
+
+
+def test_is_budget_window_newly_armed_duration_changed():
+    from litellm.proxy.common_utils.timezone_utils import is_budget_window_newly_armed
+
+    assert is_budget_window_newly_armed(
+        new_duration="7d",
+        existing_duration="30d",
+        existing_reset_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    ) is True
+
+
+def test_is_budget_window_newly_armed_unchanged_resend_preserves_spend():
+    from litellm.proxy.common_utils.timezone_utils import is_budget_window_newly_armed
+
+    future = datetime.now(timezone.utc) + timedelta(days=15)
+    assert is_budget_window_newly_armed(
+        new_duration="30d",
+        existing_duration="30d",
+        existing_reset_at=future,
+    ) is False
+
+
+def test_is_budget_window_newly_armed_expired_window_rearms():
+    from litellm.proxy.common_utils.timezone_utils import is_budget_window_newly_armed
+
+    past = datetime.now(timezone.utc) - timedelta(days=1)
+    assert is_budget_window_newly_armed(
+        new_duration="30d",
+        existing_duration="30d",
+        existing_reset_at=past,
+    ) is True
+
+
+def test_is_budget_window_newly_armed_none_duration():
+    from litellm.proxy.common_utils.timezone_utils import is_budget_window_newly_armed
+
+    assert is_budget_window_newly_armed(
+        new_duration=None, existing_duration="30d", existing_reset_at=None
+    ) is False
