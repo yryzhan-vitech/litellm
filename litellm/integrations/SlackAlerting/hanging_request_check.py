@@ -58,6 +58,11 @@ class AlertingHangingRequestCheck:
             return
 
         request_metadata = get_litellm_metadata_from_kwargs(kwargs=request_data)
+        # [ARC-BUG-08] at pre-call time litellm_params is absent, so the helper
+        # returns {} and the hanging alert loses the key/team alias; fall back
+        # to top-level metadata (a populated litellm_params is always preferred)
+        if not request_metadata:
+            request_metadata = request_data.get("metadata", {}) or {}
         model = request_data.get("model", "")
         api_base: Optional[str] = None
 
