@@ -3,6 +3,7 @@
 # Logging function -> log the exact model details + what's being sent | Non-Blocking
 import copy
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -4459,6 +4460,24 @@ def is_valid_sha256_hash(value: str) -> bool:
     return bool(re.fullmatch(r"[a-fA-F0-9]{64}", value))
 
 
+def _sanitize_user_api_key_hash(value: Optional[Any]) -> Optional[str]:
+    # [ARC-BUG-23] Hash a raw sk-/JWT under user_api_key_hash so it is never
+    # persisted to a log sink (e.g. S3) in cleartext. Inlined (no proxy import)
+    # to keep this core path SDK-safe; mirrors UserAPIKeyAuth._safe_hash_litellm_api_key.
+    if not value or not isinstance(value, str):
+        return value
+    if is_valid_sha256_hash(value):
+        return value
+    candidate = value.strip()
+    if candidate[:7].lower() == "bearer ":
+        candidate = candidate[7:].strip()
+    if candidate.startswith("sk-"):
+        return hashlib.sha256(candidate.encode()).hexdigest()
+    if len(candidate.split(".")) == 3:
+        return f"hashed-jwt-{hashlib.sha256(candidate.encode()).hexdigest()}"
+    return value
+
+
 class StandardLoggingPayloadSetup:
     @staticmethod
     def cleanup_timestamps(
@@ -4640,6 +4659,10 @@ class StandardLoggingPayloadSetup:
             user_api_key = metadata.get("user_api_key")
             if user_api_key and isinstance(user_api_key, str) and is_valid_sha256_hash(user_api_key):
                 clean_metadata["user_api_key_hash"] = user_api_key
+            # [ARC-BUG-23] never persist a raw virtual key under user_api_key_hash
+            clean_metadata["user_api_key_hash"] = _sanitize_user_api_key_hash(
+                clean_metadata.get("user_api_key_hash")
+            )
             _potential_requester_metadata = metadata.get(
                 "metadata", None
             )  # check if user passed metadata in the sdk request - e.g. metadata for langsmith logging - https://docs.litellm.ai/docs/observability/langsmith_integration#set-langsmith-fields
@@ -5482,6 +5505,10 @@ def get_standard_logging_metadata(
         if metadata.get("user_api_key") is not None:
             if is_valid_sha256_hash(str(metadata.get("user_api_key"))):
                 clean_metadata["user_api_key_hash"] = metadata.get("user_api_key")  # this is the hash
+        # [ARC-BUG-23] never persist a raw virtual key under user_api_key_hash
+        clean_metadata["user_api_key_hash"] = _sanitize_user_api_key_hash(
+            clean_metadata.get("user_api_key_hash")
+        )
     return clean_metadata
 
 
