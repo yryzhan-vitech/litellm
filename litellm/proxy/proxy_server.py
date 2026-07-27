@@ -167,6 +167,7 @@ try:
     import orjson
     import yaml  # type: ignore
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.schedulers.base import SchedulerNotRunningError
 except ImportError as e:
     raise ImportError(f"Missing dependency {e}. Run `pip install 'litellm[proxy]'`")
 
@@ -237,6 +238,7 @@ from litellm.constants import (
     PROXY_BATCH_WRITE_AT,
     PROXY_BUDGET_RESCHEDULER_MAX_TIME,
     PROXY_BUDGET_RESCHEDULER_MIN_TIME,
+    PROXY_SHUTDOWN_SPEND_DRAIN_TIMEOUT_SECONDS,
 )
 from litellm.exceptions import RejectedRequestError
 from litellm.integrations.custom_guardrail import ModifyResponseException
@@ -534,6 +536,7 @@ from litellm.proxy.utils import (
     migrate_passwords_to_scrypt_async,
     model_dump_with_preserved_fields,
     prefetch_config_params,
+    update_daily_tag_spend,
     update_spend,
 )
 from litellm.proxy.video_endpoints.endpoints import router as video_router
@@ -771,9 +774,103 @@ def cleanup_router_config_variables():
     prisma_client = None
 
 
+async def _pending_spend_log_rows() -> int:
+    """Rows still buffered in the two request-time queues update_spend drains.
+
+    Both are capped per pass at MAX_LOGS_PER_INTERVAL (10k), so a single call
+    cannot be assumed to have emptied them.
+    """
+    if prisma_client is None:
+        return 0
+    async with prisma_client._spend_log_transactions_lock:
+        pending = len(prisma_client.spend_log_transactions)
+    async with prisma_client._tool_usage_transactions_lock:
+        pending += len(prisma_client.tool_usage_transactions)
+    return pending
+
+
+# [ARC-BUG-21] flush in-memory spend buffers before Prisma disconnects; worker
+# recycle / SIGTERM otherwise drops every row buffered since the last interval
+async def _drain_spend_buffers_on_shutdown() -> None:
+    if scheduler is not None:
+        with contextlib.suppress(SchedulerNotRunningError):
+            scheduler.shutdown(wait=False)
+
+    if prisma_client is None or ProxyUpdateSpend.disable_spend_updates():
+        return
+
+    # One shared deadline for the whole drain, not one per step: the pod is
+    # already terminating, and SIGTERM -> SIGKILL is a fixed grace period, so
+    # per-step timeouts would multiply past it and get the process killed
+    # mid-write instead of losing only the tail.
+    deadline = time.monotonic() + PROXY_SHUTDOWN_SPEND_DRAIN_TIMEOUT_SECONDS
+
+    def _remaining() -> float:
+        return deadline - time.monotonic()
+
+    for label, coro_factory in (
+        (
+            "spend buffer",
+            lambda: update_spend(prisma_client, db_writer_client, proxy_logging_obj),
+        ),
+        (
+            "daily tag spend",
+            lambda: update_daily_tag_spend(prisma_client, proxy_logging_obj),
+        ),
+    ):
+        # update_spend drains both spend-log and tool-usage queues, but takes at
+        # most MAX_LOGS_PER_INTERVAL (10k) rows from each per call and does NOT
+        # loop. On the scheduled path the next interval picks up the remainder;
+        # on shutdown there is no next interval, so anything past the cap would
+        # be lost silently. Repeat until the queues are empty or time runs out.
+        # daily-tag-spend keeps a single pass — it has no such queue, so
+        # _pending_spend_log_rows() stays 0 and the loop exits after one round.
+        while True:
+            remaining = _remaining()
+            if remaining <= 0:
+                verbose_proxy_logger.warning(
+                    "Draining %s on shutdown exceeded %ss; %s buffered rows may be lost",
+                    label,
+                    PROXY_SHUTDOWN_SPEND_DRAIN_TIMEOUT_SECONDS,
+                    await _pending_spend_log_rows(),
+                )
+                break
+
+            before = await _pending_spend_log_rows()
+            try:
+                await asyncio.wait_for(coro_factory(), timeout=remaining)
+            except asyncio.TimeoutError:
+                verbose_proxy_logger.warning(
+                    "Draining %s on shutdown exceeded %ss; %s buffered rows may be lost",
+                    label,
+                    PROXY_SHUTDOWN_SPEND_DRAIN_TIMEOUT_SECONDS,
+                    await _pending_spend_log_rows(),
+                )
+                break
+            except Exception as e:
+                verbose_proxy_logger.error(f"Error draining {label} on shutdown: {e}")
+                break
+
+            after = await _pending_spend_log_rows()
+            if after == 0:
+                break
+            if after >= before:
+                # No forward progress: the writer is failing silently or rows are
+                # arriving as fast as we drain. Stop rather than spin to the
+                # deadline holding up the shutdown path.
+                verbose_proxy_logger.warning(
+                    "Draining %s on shutdown made no progress (%s rows before, %s after); giving up",
+                    label,
+                    before,
+                    after,
+                )
+                break
+
+
 async def proxy_shutdown_event():
     global prisma_client, master_key, user_custom_auth, user_custom_key_generate, user_custom_key_update
     verbose_proxy_logger.info("Shutting down LiteLLM Proxy Server")
+    await _drain_spend_buffers_on_shutdown()
     if prisma_client:
         verbose_proxy_logger.debug("Disconnecting from Prisma")
         await prisma_client.disconnect()
