@@ -7,6 +7,7 @@ import pytest
 sys.path.insert(0, os.path.abspath("../../../../.."))
 
 
+import litellm
 from litellm.litellm_core_utils.prompt_templates.factory import (
     THOUGHT_SIGNATURE_SEPARATOR,
 )
@@ -1395,13 +1396,204 @@ def test_should_not_add_cache_control_for_non_anthropic_model():
     for model in [
         CACHE_CONTROL_NON_ANTHROPIC_MODEL,
         "openai/gpt-4-turbo",
-        "gemini-pro",
     ]:
         target = {}
         adapter._add_cache_control_if_applicable(
             {"cache_control": cache_control}, target, model
         )
         assert "cache_control" not in target
+
+
+@pytest.fixture
+def gemini_cache_control_enabled(monkeypatch):
+    """[ARC-BUG-22] The Gemini arm is opt-in and off by default; tests that
+    assert the preserve behaviour must turn it on explicitly."""
+    monkeypatch.setattr(litellm, "enable_gemini_cache_control_passthrough", True)
+
+
+def test_gemini_cache_control_passthrough_is_off_by_default():
+    """[ARC-BUG-22] Default-off is the whole safety property: the downstream
+    separate_cached_messages() keeps only the first continuous cached block, so
+    enabling this for a moving-breakpoint client reorders the conversation and
+    pays a full-rate cachedContents create per turn (upstream #17201, closed
+    not_planned). Claude and Bedrock-ARN targets are unaffected by the flag."""
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    assert litellm.enable_gemini_cache_control_passthrough is False
+
+    for model in ["gemini/gemini-2.5-flash", "gemini-2.5-pro", "vertex_ai/gemini-1.5-pro"]:
+        assert (
+            adapter.supports_cache_control_passthrough(model) is False
+        ), f"gemini arm active without opt-in: {model}"
+        target = {}
+        adapter._add_cache_control_if_applicable(
+            {"cache_control": {"type": "ephemeral"}}, target, model
+        )
+        assert "cache_control" not in target, f"forwarded without opt-in: {model}"
+
+    for model in [
+        "anthropic/claude-sonnet-4-5",
+        "claude-sonnet-4-5",
+        "arn:aws:bedrock:us-east-1:123:application-inference-profile/abc",
+    ]:
+        assert (
+            adapter.supports_cache_control_passthrough(model) is True
+        ), f"flag must not gate the pre-existing arms: {model}"
+
+
+def test_should_add_cache_control_for_gemini_family_models(gemini_cache_control_enabled):
+    """[ARC-BUG-22] With the opt-in flag on, cache_control must survive for
+    Gemini targets — their request transformation consumes it to drive Gemini
+    context caching (cachedContents). Previously stripped unconditionally, so
+    explicit context caching could never engage for Anthropic-format clients
+    pointed at a Gemini-backed deployment."""
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    cache_control = {"type": "ephemeral"}
+
+    for model in [
+        "gemini/gemini-2.5-flash",
+        "gemini-pro",
+        "vertex_ai/gemini-2.5-pro",
+        "vertex_ai_beta/gemini-1.5-pro",
+    ]:
+        target = {}
+        adapter._add_cache_control_if_applicable(
+            {"cache_control": cache_control}, target, model
+        )
+        assert "cache_control" in target, f"stripped for {model}"
+        assert target["cache_control"] == cache_control
+
+
+def test_should_not_add_cache_control_for_vertex_partner_models(gemini_cache_control_enabled):
+    """[ARC-BUG-22] Vertex AI partner / Model-Garden targets reach through the
+    same vertex_ai/ prefix but route via vertex_ai_partner_models and have no
+    cachedContent support, so forwarding cache_control risks a 400. Guards the
+    prefix match in is_gemini_family_model from being over-broad."""
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    cache_control = {"type": "ephemeral"}
+
+    for model in [
+        "vertex_ai/mistral-large@2407",
+        "vertex_ai/llama-3.1-405b-instruct-maas",
+        "vertex_ai/jamba-1.5-large",
+        "vertex_ai/deepseek-r1",
+        "vertex_ai/qwen2",
+        "vertex_ai_beta/mistral-nemo",
+    ]:
+        assert (
+            adapter.supports_cache_control_passthrough(model) is False
+        ), f"unexpectedly preserved for {model}"
+        target = {}
+        adapter._add_cache_control_if_applicable(
+            {"cache_control": cache_control}, target, model
+        )
+        assert "cache_control" not in target, f"forwarded for {model}"
+
+
+def test_supports_cache_control_passthrough_target_matrix(gemini_cache_control_enabled):
+    """[ARC-BUG-22] Matrix over the three preserved arms — Claude, Bedrock ARN
+    (#29823), Gemini-family — against the targets that must still strip.
+
+    Covers BOTH model-string forms, because the two entry points differ: the
+    /v1/messages handler rebinds model to the provider-stripped name via
+    get_llm_provider() before the adapter runs, while the guardrail-translation
+    path passes the raw request body with the prefix intact. Asserting only the
+    prefixed form would leave the path production actually takes uncovered."""
+    adapter = LiteLLMAnthropicMessagesAdapter()
+
+    for model in [
+        # prefixed (guardrail-translation path)
+        "anthropic/claude-sonnet-4-5",
+        "vertex_ai/claude-3-sonnet@20240229",
+        "arn:aws:bedrock:us-east-1:123:application-inference-profile/abc",
+        "vertex_ai/gemini-1.5-pro",
+        "gemini/gemini-2.5-flash",
+        # provider-stripped (/v1/messages path — what the gate really sees)
+        "gemini-2.5-pro",
+        "gemini-2.0-flash",
+        "gemini-pro",
+        "claude-sonnet-4-5",
+    ]:
+        assert (
+            adapter.supports_cache_control_passthrough(model) is True
+        ), f"expected preserve for {model}"
+
+    for model in [
+        # prefixed
+        "vertex_ai/mistral-large",
+        "vertex_ai/llama3",
+        "openai/gpt-4-turbo",
+        # provider-stripped — the partner exclusion must hold without a prefix
+        "mistral-large@2407",
+        "llama-3.1-405b-instruct-maas",
+        "jamba-1.5-large",
+        "deepseek-r1",
+        "qwen2",
+        "gpt-4",
+        "gpt-4o-gemini-lookalike",
+    ]:
+        assert (
+            adapter.supports_cache_control_passthrough(model) is False
+        ), f"expected strip for {model}"
+
+
+def test_gemini_family_matching_is_case_and_segment_robust(gemini_cache_control_enabled):
+    """[ARC-BUG-22] Two properties the fixture-shaped tests above cannot pin,
+    each found by a mutation that otherwise passes the entire suite:
+
+    1. Case folding — every other fixture is already lowercase, so deleting
+       .lower() is invisible. Model names arriving from a raw client body or an
+       alias are not normalized anywhere on this path.
+    2. Only the FIRST slash may be split. Using split("/")[-1] takes the last
+       segment and re-introduces exactly the partner-model false positive the
+       exclusion test exists to prevent, while still passing it.
+    """
+    adapter = LiteLLMAnthropicMessagesAdapter()
+
+    for model in [
+        "Gemini-2.5-Pro",
+        "GEMINI-2.5-PRO",
+        "Vertex_AI/gemini-1.5-pro",
+        "GEMINI/Gemini-2.5-Flash",
+    ]:
+        assert (
+            adapter.supports_cache_control_passthrough(model) is True
+        ), f"case variant not matched: {model}"
+
+    for model in [
+        # multi-segment: the name after the FIRST slash is not a Gemini name
+        "vertex_ai/publishers/google/models/gemini-2.5-pro",
+        "vertex_ai/mistral-large/gemini-tuned",
+        "vertex_ai/projects/p/locations/l/endpoints/123",
+    ]:
+        assert (
+            adapter.supports_cache_control_passthrough(model) is False
+        ), f"multi-segment form wrongly preserved: {model}"
+
+
+def test_should_not_add_cache_control_for_gemma_models(gemini_cache_control_enabled):
+    """[ARC-BUG-22] Gemma is a separate family with no cachedContent support,
+    but the registry carries two entries literally named "gemini-gemma-*"
+    (gemini/gemini-gemma-2-27b-it, gemini/gemini-gemma-2-9b-it) that a bare
+    startswith("gemini") would preserve — exactly the downstream 400 this gate
+    exists to prevent. Plain gemma names must strip as well."""
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    cache_control = {"type": "ephemeral"}
+
+    for model in [
+        "gemini/gemini-gemma-2-27b-it",
+        "gemini/gemini-gemma-2-9b-it",
+        "gemini-gemma-2-27b-it",
+        "gemini/gemma-3-27b-it",
+        "gemma-3-27b-it",
+    ]:
+        assert (
+            adapter.supports_cache_control_passthrough(model) is False
+        ), f"unexpectedly preserved for {model}"
+        target = {}
+        adapter._add_cache_control_if_applicable(
+            {"cache_control": cache_control}, target, model
+        )
+        assert "cache_control" not in target, f"forwarded for {model}"
 
 
 def test_should_not_add_cache_control_when_none():

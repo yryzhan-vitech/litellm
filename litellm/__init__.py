@@ -316,6 +316,15 @@ disable_token_counter: bool = False
 disable_add_transform_inline_image_block: bool = False
 disable_add_user_agent_to_request_tags: bool = False
 disable_anthropic_gemini_context_caching_transform: bool = False
+# [ARC-BUG-22] opt-in: preserve cache_control for Gemini targets in the
+# /v1/messages adapter. Off by default because separate_cached_messages() keeps
+# only the first continuous cached block, so a moving-breakpoint client would get
+# a reordered conversation and a full-rate cachedContents create per turn
+# (upstream BerriAI/litellm#17201, closed not_planned). Enable only together with
+# a last-wins prefix fix.
+enable_gemini_cache_control_passthrough: bool = (
+    os.getenv("LITELLM_ENABLE_GEMINI_CACHE_CONTROL_PASSTHROUGH", "false").lower() == "true"
+)
 enable_anthropic_prompt_caching: bool = os.getenv("LITELLM_ENABLE_ANTHROPIC_PROMPT_CACHING", "false").lower() == "true"
 _anthropic_prompt_caching_ttl_env: Optional[str] = os.getenv("LITELLM_ANTHROPIC_PROMPT_CACHING_TTL")
 anthropic_prompt_caching_ttl: Optional[Literal["5m", "1h"]] = (

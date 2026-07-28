@@ -28,6 +28,10 @@ EXCLUDED_GUARD_ONLY_VARS = {
 # environment settings docs until the feature is ready for broad use.
 EXCLUDED_ROLLOUT_FLAGS = {
     "LITELLM_USE_RUST_OCR",
+    # [ARC-BUG-22] fork-only, default-off rollout flag. Deliberately undocumented:
+    # it must stay off until the first-found-vs-last-wins reordering in
+    # separate_cached_messages() is fixed (upstream #17201, closed not_planned).
+    "LITELLM_ENABLE_GEMINI_CACHE_CONTROL_PASSTHROUGH",
 }
 
 EXCLUDED_TERMINAL_VARS = {

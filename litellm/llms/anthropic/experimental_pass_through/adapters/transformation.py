@@ -309,7 +309,7 @@ class LiteLLMAnthropicMessagesAdapter:
         cache_control = (
             source.get("cache_control") if isinstance(source, dict) else getattr(source, "cache_control", None)
         )
-        if cache_control and model and (self.is_anthropic_claude_model(model) or self.is_bedrock_arn_model(model)):
+        if cache_control and model and self.supports_cache_control_passthrough(model):
             # TypedDict objects support dict operations at runtime
             # Use type ignore consistent with codebase pattern (see anthropic/chat/transformation.py:432)
             if isinstance(target, dict):
@@ -638,6 +638,87 @@ class LiteLLMAnthropicMessagesAdapter:
         """
         model_lower = model.lower()
         return "anthropic" in model_lower or "claude" in model_lower
+
+    @staticmethod
+    def supports_cache_control_passthrough(model: str) -> bool:
+        """
+        [ARC-BUG-22] Whether cache_control blocks survive translation of an
+        Anthropic /v1/messages request for this target.
+
+        True for Claude (native prompt caching), Bedrock ARNs (which point at
+        Claude but name neither), and Gemini-family targets, whose request
+        transformation consumes cache_control to drive Gemini context caching
+        (cachedContents) — see litellm/llms/vertex_ai/context_caching/.
+
+        False for everything else, which includes the Vertex AI partner /
+        Model-Garden targets (mistral, llama, jamba, deepseek, qwen) reached
+        through the same vertex_ai/ prefix: they route through
+        vertex_ai_partner_models and do not support cachedContent, so
+        forwarding cache_control to them risks a 400. There is no name
+        blocklist — they are excluded because their model name is not a Gemini
+        name, the same way gpt-4 is.
+
+        The Gemini arm is OPT-IN, off by default, behind
+        litellm.enable_gemini_cache_control_passthrough. Preserving the field is
+        necessary for Gemini context caching but not sufficient to make it
+        safe: the downstream consumer separate_cached_messages() keeps only the
+        FIRST continuous cached block, so an Anthropic client whose breakpoint
+        moves with the conversation tail (Claude Code) makes Gemini see a
+        reordered conversation — the cached slice is hoisted in front of the
+        system prompt — and pays a full-rate cachedContents create every turn.
+        That reordering is a pre-existing upstream defect (reproducible with
+        this patch reverted, reported as BerriAI/litellm#17201 and closed
+        not_planned), and the guard exists so this patch does not silently
+        route traffic into it. Turn the flag on only together with a last-wins
+        prefix fix.
+        """
+        if not (
+            LiteLLMAnthropicMessagesAdapter.is_anthropic_claude_model(model)
+            or LiteLLMAnthropicMessagesAdapter.is_bedrock_arn_model(model)
+        ):
+            import litellm
+
+            if not getattr(litellm, "enable_gemini_cache_control_passthrough", False):
+                return False
+            return LiteLLMAnthropicMessagesAdapter.is_gemini_family_model(model)
+        return True
+
+    @staticmethod
+    def is_gemini_family_model(model: str) -> bool:
+        """
+        [ARC-BUG-22] Gemini-family target (Google AI Studio or Vertex AI
+        Gemini), as opposed to a Vertex AI partner model reached through the
+        same vertex_ai/ prefix.
+
+        Both forms are handled because the two entry points differ: on the
+        /v1/messages path the handler rebinds model to the provider-stripped
+        name via get_llm_provider() before the adapter runs, so this normally
+        sees "gemini-2.5-pro"; the guardrail-translation entry point
+        (anthropic/chat/guardrail_translation/handler.py) passes the raw client
+        request body, where the "gemini/" or "vertex_ai/" prefix survives.
+        """
+        model_lower = model.lower()
+        if model_lower.startswith(("gemini/", "vertex_ai/", "vertex_ai_beta/")):
+            # Prefixed form (guardrail-translation path). The bare vertex_ai/
+            # prefix also covers partner models, so require a Gemini name.
+            return LiteLLMAnthropicMessagesAdapter._is_gemini_model_name(model_lower.split("/", 1)[1])
+        # Provider-stripped form (/v1/messages path).
+        return LiteLLMAnthropicMessagesAdapter._is_gemini_model_name(model_lower)
+
+    @staticmethod
+    def _is_gemini_model_name(name: str) -> bool:
+        """
+        [ARC-BUG-22] Whether a provider-stripped model name is Gemini.
+
+        A leading "gemini" qualifies, but an alias merely containing the
+        substring elsewhere does not. Gemma is excluded even when the registry
+        names it "gemini-gemma-*" (two such entries exist): it is a different
+        model family with no cachedContent support, so preserving cache_control
+        for it is the very 400 risk this gate exists to avoid.
+        """
+        if "gemma" in name:
+            return False
+        return name.startswith("gemini")
 
     @staticmethod
     def is_bedrock_arn_model(model: str) -> bool:
