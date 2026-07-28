@@ -163,7 +163,14 @@ class NomaV2Guardrail(CustomGuardrail):
     ) -> dict:
         payload_request_data = self._sanitize_payload_for_transport(request_data)
         if logging_obj is not None:
-            payload_request_data["litellm_logging_obj"] = getattr(logging_obj, "model_call_details", None)
+            # [ARC-BUG-01] snapshot model_call_details: the async logging handler inserts keys
+            # into it on another thread, and it is assigned AFTER the json.dumps round-trip
+            # above, so the serializer downstream would iterate a live dict and raise
+            # RuntimeError: dictionary changed size during iteration
+            model_call_details = getattr(logging_obj, "model_call_details", None)
+            if isinstance(model_call_details, dict):
+                model_call_details = dict(model_call_details)
+            payload_request_data["litellm_logging_obj"] = model_call_details
 
         payload: dict[str, Any] = {
             "inputs": inputs,

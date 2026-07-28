@@ -179,6 +179,43 @@ class TestNomaV2Configuration:
         )
         assert request_data["messages"][0]["content"] == "hello"
 
+    def test_build_scan_payload_snapshots_model_call_details(self, noma_v2_guardrail):
+        class _LoggingObj:
+            def __init__(self, details):
+                self.model_call_details = details
+
+        details = {"model": "gpt-4", "call_id": "abc"}
+        logging_obj = _LoggingObj(details)
+
+        payload = noma_v2_guardrail._build_scan_payload(
+            inputs={"texts": ["hello"]},
+            request_data={"messages": [{"role": "user", "content": "hello"}]},
+            input_type="request",
+            logging_obj=logging_obj,
+            application_id=None,
+        )
+
+        embedded = payload["request_data"]["litellm_logging_obj"]
+        assert embedded == details
+        assert embedded is not details
+
+        details["inserted_by_async_handler"] = "late"
+        assert "inserted_by_async_handler" not in embedded
+
+    def test_build_scan_payload_tolerates_non_dict_model_call_details(self, noma_v2_guardrail):
+        class _LoggingObj:
+            model_call_details = None
+
+        payload = noma_v2_guardrail._build_scan_payload(
+            inputs={"texts": ["hello"]},
+            request_data={"messages": [{"role": "user", "content": "hello"}]},
+            input_type="request",
+            logging_obj=_LoggingObj(),
+            application_id=None,
+        )
+
+        assert payload["request_data"]["litellm_logging_obj"] is None
+
     def test_build_scan_payload_survives_unpicklable_request_data(
         self, noma_v2_guardrail
     ):
