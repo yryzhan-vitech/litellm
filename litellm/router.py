@@ -298,6 +298,15 @@ class Router:
         redis_port: Optional[int] = None,
         redis_password: Optional[str] = None,
         redis_db: Optional[int] = None,
+        # [ARC-BUG-36] Redis Sentinel (HA) targets. Without these the router cannot
+        # name a Sentinel-backed Redis at all -- it accepted only url / host+port, so
+        # the params the proxy passes were dropped by get_valid_args() and __init__
+        # built no Redis client. Router state then depended entirely on proxy_server
+        # borrowing the response cache in afterwards, which does not reach
+        # self.scheduler and is defeated by a stale redis_host in the config DB.
+        redis_sentinel_nodes: Optional[Union[str, list]] = None,
+        redis_service_name: Optional[str] = None,
+        redis_sentinel_password: Optional[str] = None,
         cache_responses: Optional[bool] = False,
         cache_kwargs: dict = {},  # additional kwargs to pass to RedisCache (see caching.py)
         caching_groups: Optional[List[tuple]] = None,  # if you want to cache across model groups
@@ -453,7 +462,13 @@ class Router:
         cache_config: Dict[str, Any] = {}
 
         self.client_ttl = client_ttl
-        if redis_url is not None or (redis_host is not None and redis_port is not None):
+        # [ARC-BUG-36] Sentinel is a third way to name a Redis target, alongside url
+        # and host+port. It needs BOTH sentinel_nodes and service_name -- _redis.py
+        # raises if either is missing -- so require both before claiming a target,
+        # otherwise a half-configured pair would enter this branch and then throw
+        # instead of degrading to in-memory.
+        _has_sentinel_target = redis_sentinel_nodes is not None and redis_service_name is not None
+        if redis_url is not None or (redis_host is not None and redis_port is not None) or _has_sentinel_target:
             cache_type = "redis"
 
             if redis_url is not None:
@@ -467,6 +482,14 @@ class Router:
 
             if redis_password is not None:
                 cache_config["password"] = redis_password
+
+            if _has_sentinel_target:
+                # Unprefixed names, because that is what _redis.py and cache_params
+                # already expect downstream (RedisCache forwards **kwargs verbatim).
+                cache_config["sentinel_nodes"] = redis_sentinel_nodes
+                cache_config["service_name"] = redis_service_name
+                if redis_sentinel_password is not None:
+                    cache_config["sentinel_password"] = redis_sentinel_password
 
             if redis_db is not None:
                 verbose_router_logger.warning(

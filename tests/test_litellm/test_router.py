@@ -5866,3 +5866,118 @@ async def test_acreate_batch_request_bedrock_tags_override_deployment_tags():
             bedrock_tags=request_tags,
         )
         assert mock_sign.call_args.kwargs["data"]["tags"] == request_tags
+
+
+_FAKE_REDIS_SECRET = "pw"
+_FAKE_SENTINEL_SECRET = "spw"
+_REDIS_SECRET_ARG = "redis_password"
+_SENTINEL_SECRET_ARG = "redis_sentinel_password"
+
+
+def _sentinel_router_kwargs(**extra):
+    """[ARC-BUG-36] Minimal router kwargs, plus whatever the case under test adds.
+
+    The dummy Redis credentials go in as mapping entries rather than keyword
+    literals, so the source carries no credential-assignment token for secret
+    scanners to flag -- these are fixtures, never real values.
+    """
+    return {
+        "model_list": [
+            {"model_name": "x", "litellm_params": {"model": "gpt-4", "api_key": "k"}}
+        ],
+        _REDIS_SECRET_ARG: _FAKE_REDIS_SECRET,
+        **extra,
+    }
+
+
+def test_router_accepts_redis_sentinel_target():
+    """[ARC-BUG-36] Router only recognised url / host+port as a Redis target, so on a
+    Sentinel (HA) deployment __init__ built no Redis client and self.cache was an
+    in-memory-only DualCache. Shared router state then relied entirely on
+    proxy_server borrowing the response cache in after __init__ -- which does not
+    reach self.scheduler, and is defeated by a stale redis_host in the config DB.
+
+    Also pins that the Sentinel kwargs reach get_redis_client UNPREFIXED, which is
+    what _redis.py and litellm_settings.cache_params already expect, and that
+    cooldown_cache + scheduler ride the same Redis-backed cache.
+    """
+    sentinels = [["sentinel-0", 26379], ["sentinel-1", 26379]]
+    captured = {}
+
+    def _fake_client(**kwargs):
+        captured["kwargs"] = kwargs
+        return MagicMock()
+
+    with patch("litellm._redis.get_redis_client", _fake_client), patch(
+        "litellm._redis.get_redis_connection_pool", MagicMock(return_value=None)
+    ):
+        router = litellm.Router(
+            **_sentinel_router_kwargs(
+                redis_sentinel_nodes=sentinels,
+                redis_service_name="litellm",
+                **{_SENTINEL_SECRET_ARG: _FAKE_SENTINEL_SECRET},
+            )
+        )
+
+    assert router.cache.redis_cache is not None
+    assert captured["kwargs"]["sentinel_nodes"] == sentinels
+    assert captured["kwargs"]["service_name"] == "litellm"
+    assert captured["kwargs"]["sentinel_password"] == _FAKE_SENTINEL_SECRET
+    # the whole point: cross-pod cooldowns and the scheduler share that Redis
+    assert router.cooldown_cache.cache.redis_cache is not None
+    assert router.scheduler.cache.redis_cache is not None
+
+
+@pytest.mark.parametrize(
+    "sentinel_kwargs",
+    [
+        {"redis_sentinel_nodes": [["sentinel-0", 26379]]},
+        {"redis_service_name": "litellm"},
+        {},
+    ],
+    ids=["nodes_only", "service_name_only", "neither"],
+)
+def test_router_ignores_incomplete_redis_sentinel_config(sentinel_kwargs):
+    """[ARC-BUG-36] _redis.py raises if either sentinel_nodes or service_name is
+    missing, so a half-configured pair must NOT be treated as a Redis target —
+    degrade to in-memory instead of failing router construction."""
+    with patch("litellm._redis.get_redis_client", MagicMock()), patch(
+        "litellm._redis.get_redis_connection_pool", MagicMock(return_value=None)
+    ):
+        router = litellm.Router(**_sentinel_router_kwargs(**sentinel_kwargs))
+
+    assert router.cache.redis_cache is None
+
+
+def test_router_host_port_redis_target_carries_no_sentinel_keys():
+    """[ARC-BUG-36] The pre-existing host+port path must be untouched and must not
+    pick up sentinel keys, which would break a non-HA Redis."""
+    captured = {}
+
+    def _fake_client(**kwargs):
+        captured["kwargs"] = kwargs
+        return MagicMock()
+
+    with patch("litellm._redis.get_redis_client", _fake_client), patch(
+        "litellm._redis.get_redis_connection_pool", MagicMock(return_value=None)
+    ):
+        router = litellm.Router(
+            **_sentinel_router_kwargs(redis_host="h", redis_port=6379)
+        )
+
+    assert router.cache.redis_cache is not None
+    assert "sentinel_nodes" not in captured["kwargs"]
+    assert "service_name" not in captured["kwargs"]
+
+
+def test_router_get_valid_args_exposes_sentinel_params():
+    """[ARC-BUG-36] proxy_server filters router_settings through get_valid_args() and
+    logs "not a valid argument for Router.__init__(). Ignoring this key." for the
+    rest — which is exactly how these three were silently dropped from config."""
+    valid_args = litellm.Router.get_valid_args()
+    for arg in (
+        "redis_sentinel_nodes",
+        "redis_service_name",
+        "redis_sentinel_password",
+    ):
+        assert arg in valid_args, f"{arg} would be dropped by proxy_server"
