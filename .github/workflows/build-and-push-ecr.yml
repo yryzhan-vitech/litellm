@@ -3,12 +3,32 @@ name: Build and push ECR image
 on:
   # Auto-build only when image content changes — docs/tests/CI don't affect the image
   push:
-    branches: [main]
+    branches:
+      - main
+      # Versioned patch-stack branches (one ARC-BUG per commit, base v1.94.0+).
+      # These are what dev-ai actually runs, so a push here should produce an
+      # image without a manual dispatch. A push lands an immutable
+      # <branch>-<sha> tag in the provisioning hub (246511608293), which
+      # replicates to every spoke — including 258174056699 (dev-ai) and
+      # 572630832277 (prd-ai).
+      #
+      # Two patterns, both live:
+      #   arcadia-v*       current naming, one branch per upstream release
+      #                    (arcadia-v1.94.0, arcadia-v1.95.0, ...)
+      #   arcadia-clean-*  previous naming, kept so the rc.3-based
+      #                    arcadia-clean-v1.94 branch still builds during and
+      #                    after the migration. Remove once nothing tracks it.
+      - 'arcadia-v*'
+      - 'arcadia-clean-*'
     paths-ignore:
       - '**.md'
       - 'docs/**'
       - 'tests/**'
-      - '.github/**'
+      # `.github/**` deliberately NOT ignored: a change to this workflow (build
+      # args, tag scheme, base image) changes what gets produced, so it must be
+      # buildable without a manual dispatch. Costs an occasional no-op rebuild
+      # when only CI metadata changes — acceptable versus silently shipping a
+      # stale image after a build-logic edit.
       - '.circleci/**'
       - 'cookbook/**'
       - 'ui/**/*.test.*'
@@ -28,9 +48,17 @@ jobs:
   build:
     name: Build and push force-multiplier/litellm
     runs-on: ubuntu-latest
-    # Deploys to the shared prd-ai ECR — gate on the public shipping branch.
-    # Fork branches / PRs shouldn't push, only verified merges.
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    # Gate on our own shipping branches. PRs and one-off feature branches must
+    # not push; `main` (legacy prod lineage), `arcadia-v*` (current naming) and
+    # `arcadia-clean-*` (previous naming) may, plus any manual dispatch. Keep
+    # this in sync with the `push` branch filter above — the filter decides what
+    # triggers, this decides what is allowed to push, and a dispatch can target
+    # any ref, so this gate is the real authority.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.ref == 'refs/heads/main'
+      || startsWith(github.ref, 'refs/heads/arcadia-v')
+      || startsWith(github.ref, 'refs/heads/arcadia-clean-')
 
     env:
       AWS_REGION: us-east-1
@@ -51,9 +79,20 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
 
       - name: Configure AWS credentials (OIDC federation)
-        # Assumes IAM role github-actions-arcadia-litellm-ecr in account 246511608293.
-        # Role trust is scoped to repo:arcadia/litellm:ref:refs/heads/main;
-        # inline policy grants only ECR push on force-multiplier/litellm.
+        # Pushes to the PROVISIONING HUB account 246511608293 (ECR_REGISTRY above),
+        # whose registry replication has no repository filters and fans out to
+        # every spoke — 258174056699 (dev-ai), 572630832277 (prd-ai),
+        # 319859009076, 498769975733, 211125583766. That is why building here is
+        # sufficient: no per-account build or manual copy is needed for images.
+        #
+        # ⚠️ Corrected 2026-07-29: this comment previously claimed the role is
+        # `github-actions-arcadia-litellm-ecr` with trust scoped to
+        # `refs/heads/main`. Both were wrong. That role exists but has never been
+        # used (RoleLastUsed empty). AWS_ECR_ROLE_ARN actually resolves to
+        # `AllowToPushToECR` (roleId AROATSZJ4UHSW5KB3UBG6, confirmed from the
+        # run-30464830709 log), whose trust condition is `repo:arcadia/*` — any
+        # branch of any arcadia repo. So no IAM change was needed to build from
+        # `arcadia-clean-*`; the only gate was this workflow's own branch filter.
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4.3.1
         with:
           role-to-assume: ${{ secrets.AWS_ECR_ROLE_ARN }}
@@ -81,12 +120,26 @@ jobs:
         run: |
           SHORT_SHA=$(git rev-parse --short=10 HEAD)
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          # Prefix the SHA tag with the branch so provenance is readable from the
+          # tag alone. `main-<sha>` is the legacy prod lineage (v1.88 patchstack)
+          # and MUST keep that exact shape — prd-ai runs `main-a2e1b93d30` today.
+          # A clean-stack build must not masquerade as it, so derive the prefix
+          # from the ref rather than hardcoding `main`. Non-alphanumerics are
+          # squashed to `-` because Docker tags allow only [A-Za-z0-9_.-].
+          REF_NAME="${GITHUB_REF#refs/heads/}"
+          TAG_PREFIX=$(printf '%s' "${REF_NAME}" | tr -c 'A-Za-z0-9_.-' '-')
+          echo "tag_prefix=${TAG_PREFIX}" >> "$GITHUB_OUTPUT"
           # Only publish the commit SHA tag (immutable, traceable). Deliberately
           # NOT moving `latest` or any named alias — consumers that depend on
           # specific tags (e.g. the current `noma-v2-complete-fix` deployment)
           # must not have them reinterpreted underfoot by subsequent builds.
           # To cut a named release, run workflow_dispatch with extra_tag set.
-          TAG_LIST="${ECR_REGISTRY}/${ECR_REPO}:main-${SHORT_SHA}"
+          #
+          # NEVER reuse an existing tag: `imagePullPolicy: IfNotPresent` means
+          # pods keep the digest they already have, so a rebuilt tag runs the OLD
+          # code while every doc claims otherwise. This bit us on
+          # arcadia-v1.94.0-rc.3-v21. Verify rollouts by pod imageID digest.
+          TAG_LIST="${ECR_REGISTRY}/${ECR_REPO}:${TAG_PREFIX}-${SHORT_SHA}"
           if [ -n "${EXTRA_TAG}" ]; then
             TAG_LIST="${TAG_LIST},${ECR_REGISTRY}/${ECR_REPO}:${EXTRA_TAG}"
           fi
@@ -112,18 +165,25 @@ jobs:
         # script body) so neither can inject shell commands into the summary.
         env:
           SHORT_SHA: ${{ steps.tags.outputs.short_sha }}
+          TAG_PREFIX: ${{ steps.tags.outputs.tag_prefix }}
           EXTRA_TAG: ${{ inputs.extra_tag }}
         run: |
           echo "## Image pushed to ECR" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Repo**: \`${ECR_REGISTRY}/${ECR_REPO}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Primary tag**: \`main-${SHORT_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Primary tag**: \`${TAG_PREFIX}-${SHORT_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           if [ -n "${EXTRA_TAG}" ]; then
             echo "- **Also tagged**: \`${EXTRA_TAG}\`" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "- No extra tag applied." >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "To deploy, update \`proxy.image.tag\` in" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`cloud-config-infrastructures/prd/ai/litellm-internal/application.yaml\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "to \`main-${SHORT_SHA}\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "Pushed to the provisioning hub (\`246511608293\`), which replicates to" >> "$GITHUB_STEP_SUMMARY"
+          echo "every spoke account — \`258174056699\` (dev-ai), \`572630832277\` (prd-ai)," >> "$GITHUB_STEP_SUMMARY"
+          echo "\`319859009076\`, \`498769975733\`, \`211125583766\`. Replication takes ~1min;" >> "$GITHUB_STEP_SUMMARY"
+          echo "verify with \`aws ecr describe-images --profile <acct>\` before deploying." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "To deploy, set \`proxy.image.tag\` to \`${TAG_PREFIX}-${SHORT_SHA}\` in the" >> "$GITHUB_STEP_SUMMARY"
+          echo "target env's CCI file, e.g." >> "$GITHUB_STEP_SUMMARY"
+          echo "\`preprd/dev-ai/litellm-internal/application.yaml\` (dev-ai) or" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`prd/ai/litellm-internal/application.yaml\` (prd-ai)." >> "$GITHUB_STEP_SUMMARY"
