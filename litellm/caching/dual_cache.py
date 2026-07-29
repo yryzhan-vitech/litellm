@@ -103,17 +103,57 @@ class DualCache(BaseCache):
         if default_redis_ttl is not None:
             self.default_redis_ttl = default_redis_ttl
 
-    def _backfill_kwargs(self, kwargs: "dict[str, object]") -> "dict[str, object]":
+    async def _get_remaining_redis_ttls(self, keys: List[str]) -> Dict[str, Optional[float]]:
+        """
+        [ARC-BUG-39] Remaining Redis TTL per key, or an empty dict when it cannot
+        be determined. Never raises and never blocks the read path: an unknown
+        TTL simply means "do not clamp", which preserves the previous behaviour.
+        """
+        if not keys or self.redis_cache is None:
+            return {}
+        getter = getattr(self.redis_cache, "async_batch_get_cache_ttls", None)
+        if getter is None:
+            return {}
+        try:
+            ttls = await getter(keys)
+        except Exception:
+            return {}
+        if not isinstance(ttls, dict):
+            # A backend that returns something else (or a test double) must not
+            # be able to inject a non-numeric TTL into the backfill.
+            return {}
+        return {k: v for k, v in ttls.items() if isinstance(v, (int, float))}
+
+    def _backfill_kwargs(
+        self, kwargs: "dict[str, object]", remaining_redis_ttl: Optional[float] = None
+    ) -> "dict[str, object]":
         """
         Kwargs for writing a Redis read result into the in-memory tier.
 
         Applies ``default_in_memory_ttl`` exactly like the write paths do;
         without it, backfilled entries fall to ``InMemoryCache``'s own default
         TTL and can outlive the TTL this cache was configured with.
+
+        [ARC-BUG-39] When the caller knows how much longer Redis will keep the
+        value, that wins over any configured default: a backfilled copy must
+        never outlive the authoritative Redis entry. Without this, a short-lived
+        key (a 30s router cooldown) is pinned in memory for the cache's default
+        instead, and the reading pod keeps serving it after Redis has expired it
+        -- there is no expiry reconciliation on the read path, because memory is
+        consulted first and a present value stops the Redis lookup.
+
+        ``default_in_memory_ttl`` alone can only cap that staleness at a global
+        constant; clamping to the value's own remaining TTL removes it.
         """
+        ttl: Optional[float] = None
         if "ttl" not in kwargs and self.default_in_memory_ttl is not None:
-            return {**kwargs, "ttl": self.default_in_memory_ttl}
-        return kwargs
+            ttl = self.default_in_memory_ttl
+        if remaining_redis_ttl is not None and remaining_redis_ttl > 0:
+            # Never cache locally for longer than Redis will hold it.
+            ttl = remaining_redis_ttl if ttl is None else min(ttl, remaining_redis_ttl)
+        if ttl is None:
+            return kwargs
+        return {**kwargs, "ttl": ttl}
 
     def set_cache(self, key, value, local_only: bool = False, **kwargs):
         # Update both Redis and in-memory cache
@@ -325,12 +365,25 @@ class DualCache(BaseCache):
                     # Pre-compute key-to-index mapping for O(1) lookup
                     key_to_index = {key: i for i, key in enumerate(keys)}
 
+                    # [ARC-BUG-39] One extra pipelined round-trip for the whole
+                    # batch, so each backfilled copy can be clamped to the time
+                    # Redis will actually keep it. Without this a 30s cooldown is
+                    # pinned locally for the in-memory default and the pod keeps
+                    # excluding a deployment Redis already released.
+                    remaining_ttls = await self._get_remaining_redis_ttls(
+                        [k for k, v in redis_result.items() if v is not None]
+                    )
+
                     # Update both result and in-memory cache in a single loop
                     for key, value in redis_result.items():
                         result[key_to_index[key]] = value
 
                         if value is not None and self.in_memory_cache is not None:
-                            await self.in_memory_cache.async_set_cache(key, value, **self._backfill_kwargs(kwargs))
+                            await self.in_memory_cache.async_set_cache(
+                                key,
+                                value,
+                                **self._backfill_kwargs(kwargs, remaining_ttls.get(key)),
+                            )
 
             return result
         except Exception:

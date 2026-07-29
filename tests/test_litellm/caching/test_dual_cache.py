@@ -445,3 +445,89 @@ async def test_dual_cache_late_attach_redis_wires_writes_and_ttl_async():
     assert mock_redis.async_set_cache.call_args[0][:2] == (key_after, val_after)
 
     assert in_memory.get_cache(key_after) == val_after
+
+
+def test_backfill_clamps_to_remaining_redis_ttl():
+    """[ARC-BUG-39] A local backfill must never outlive the Redis entry it copied.
+
+    default_in_memory_ttl alone only caps staleness at a global constant; the
+    router's cooldowns are far shorter than that cap, so the reading pod kept
+    excluding a deployment Redis had already released. Clamping to the value's
+    own remaining TTL removes the divergence instead of bounding it.
+    """
+    dual = DualCache()
+    dual.default_in_memory_ttl = 30
+
+    # remaining TTL shorter than the configured default -> the shorter one wins
+    assert dual._backfill_kwargs({}, 5.0) == {"ttl": 5.0}
+    # longer than the default -> the default still caps it
+    assert dual._backfill_kwargs({}, 90.0) == {"ttl": 30}
+    # an explicit ttl is still clamped: Redis is authoritative
+    assert dual._backfill_kwargs({"ttl": 60}, 5.0) == {"ttl": 5.0}
+
+    dual.default_in_memory_ttl = None
+    # no default configured -> the remaining TTL alone drives it
+    assert dual._backfill_kwargs({}, 7.0) == {"ttl": 7.0}
+    # nothing known -> unchanged, i.e. previous behaviour
+    assert dual._backfill_kwargs({}) == {}
+
+
+@pytest.mark.parametrize("unknown", [None, 0, -1, -2])
+def test_backfill_treats_unknown_ttl_as_no_clamp(unknown):
+    """[ARC-BUG-39] Redis reports -2 for a missing key and -1 for no expiry, and a
+    failed TTL read yields None. None of those may be read as "expires now" —
+    that would let a Redis hiccup silently shorten entries it knows nothing about.
+    """
+    dual = DualCache()
+    dual.default_in_memory_ttl = 30
+    assert dual._backfill_kwargs({}, unknown) == {"ttl": 30}
+
+    dual.default_in_memory_ttl = None
+    assert dual._backfill_kwargs({}, unknown) == {}
+
+
+@pytest.mark.asyncio
+async def test_get_remaining_redis_ttls_never_raises():
+    """[ARC-BUG-39] TTL lookup is an optimisation on the read path — it must fail
+    open. A raising or absent Redis helper degrades to "no clamp", never to an
+    exception that would break every cache read.
+    """
+    dual = DualCache()
+    assert await dual._get_remaining_redis_ttls(["k"]) == {}   # no redis_cache
+
+    boom = MagicMock()
+    boom.async_batch_get_cache_ttls = AsyncMock(side_effect=RuntimeError("redis down"))
+    dual.redis_cache = boom
+    assert await dual._get_remaining_redis_ttls(["k"]) == {}
+
+    # a backend without the helper at all (e.g. an older RedisCache)
+    legacy = MagicMock(spec=[])
+    dual.redis_cache = legacy
+    assert await dual._get_remaining_redis_ttls(["k"]) == {}
+
+    # empty key list short-circuits without touching Redis
+    ok = MagicMock()
+    ok.async_batch_get_cache_ttls = AsyncMock(return_value={"k": 5.0})
+    dual.redis_cache = ok
+    assert await dual._get_remaining_redis_ttls([]) == {}
+    ok.async_batch_get_cache_ttls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_batch_backfill_clamps_short_lived_key():
+    """[ARC-BUG-39] End-to-end on the batch path the router uses for cooldowns:
+    a key with 4s left in Redis must not be pinned locally for the 30s default.
+    """
+    in_memory = InMemoryCache()
+    mock_redis = MagicMock()
+    mock_redis.async_batch_get_cache = AsyncMock(return_value={"cooldown:x": "on"})
+    mock_redis.async_batch_get_cache_ttls = AsyncMock(return_value={"cooldown:x": 4.0})
+
+    dual = DualCache(redis_cache=mock_redis, in_memory_cache=in_memory)
+    dual.default_in_memory_ttl = 30
+
+    with patch.object(in_memory, "async_set_cache", new=AsyncMock()) as set_mock:
+        await dual.async_batch_get_cache(keys=["cooldown:x"])
+
+    assert set_mock.await_count == 1
+    assert set_mock.await_args.kwargs.get("ttl") == 4.0

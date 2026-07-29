@@ -17,7 +17,7 @@ import json
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, cast
 
 import litellm
 from litellm._logging import print_verbose, verbose_logger
@@ -1009,6 +1009,38 @@ class RedisCache(BaseCache):
         """
         async_redis_client = self.init_async_client()
         return await async_redis_client.mget(keys=keys)  # type: ignore
+
+    async def async_batch_get_cache_ttls(self, key_list: List[str]) -> Dict[str, Optional[float]]:
+        """
+        [ARC-BUG-39] Remaining TTL, in seconds, for each key.
+
+        Read in a single non-transactional pipeline so this costs one round-trip
+        for the whole batch rather than one per key. Callers use it to keep a
+        local backfill from outliving the authoritative Redis entry.
+
+        Returns seconds remaining per key; ``None`` where the key is missing or
+        has no expiry (Redis reports -2 and -1 respectively), meaning "no clamp".
+        On any failure returns an empty dict -- callers must treat a missing
+        entry as "unknown", never as "expired", so a Redis hiccup can never
+        shorten a cache entry it knows nothing about.
+        """
+        out: Dict[str, Optional[float]] = {}
+        if not key_list:
+            return out
+        try:
+            keys = [self.check_and_fix_namespace(key=k) for k in key_list]
+            async_redis_client = self.init_async_client()
+            async with async_redis_client.pipeline(transaction=False) as pipe:  # type: ignore
+                for k in keys:
+                    pipe.ttl(k)
+                results = await pipe.execute()
+            for original, ttl in zip(key_list, results):
+                # -2 = no such key, -1 = key exists with no expiry
+                out[original] = float(ttl) if isinstance(ttl, (int, float)) and ttl > 0 else None
+        except Exception as e:
+            verbose_logger.debug("async_batch_get_cache_ttls failed, skipping TTL clamp: %s", str(e))
+            return {}
+        return out
 
     def batch_get_cache(
         self,
