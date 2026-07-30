@@ -1600,3 +1600,116 @@ def test_sign_s3_request_raises_when_botocore_missing(
                 region="us-east-1",
                 data="{}",
             )
+
+
+class TestS3V2TransientRetry:
+    """[ARC-BUG-13] The 500/503 retry must survive the handler raising on 5xx.
+
+    `AsyncHTTPHandler.put` calls `raise_for_status()` internally and returns only a
+    2xx, so a retry loop that inspects `response.status_code` never sees a 503 —
+    its `continue` is unreachable and the upload is attempted exactly once. These
+    pin the raised-error path, and pin that the sync sibling (whose handler does
+    NOT raise) still works through the status-check path.
+    """
+
+    @staticmethod
+    def _element():
+        from litellm.types.integrations.s3_v2 import s3BatchLoggingElement
+
+        return s3BatchLoggingElement(
+            s3_object_key="2026-07-30/retry.json",
+            payload={"test": "data"},
+            s3_object_download_filename="retry.json",
+        )
+
+    @staticmethod
+    def _logger():
+        lg = S3Logger(
+            s3_bucket_name="test-bucket",
+            s3_aws_access_key_id="test-key",
+            s3_aws_secret_access_key="test-secret",
+            s3_region_name="us-east-1",
+        )
+        lg.handle_callback_failure = MagicMock()
+        return lg
+
+    @staticmethod
+    def _status_error(status_code):
+        import httpx
+
+        request = httpx.Request("PUT", "https://test-bucket.s3.amazonaws.com/k.json")
+        response = httpx.Response(status_code, request=request)
+        return httpx.HTTPStatusError("boom", request=request, response=response)
+
+    def test_raised_503_is_retried_to_the_attempt_limit(self):
+        from unittest.mock import AsyncMock
+
+        lg = self._logger()
+        lg.async_httpx_client = AsyncMock()
+        lg.async_httpx_client.put.side_effect = self._status_error(503)
+
+        asyncio.run(lg.async_upload_data_to_s3(self._element()))
+
+        # 3 attempts, not 1: without the except arm the first raise escapes the loop.
+        assert lg.async_httpx_client.put.await_count == 3
+        assert lg.handle_callback_failure.call_count == 1
+
+    def test_raised_500_is_retried_too(self):
+        from unittest.mock import AsyncMock
+
+        lg = self._logger()
+        lg.async_httpx_client = AsyncMock()
+        lg.async_httpx_client.put.side_effect = self._status_error(500)
+
+        asyncio.run(lg.async_upload_data_to_s3(self._element()))
+
+        assert lg.async_httpx_client.put.await_count == 3
+
+    def test_raised_403_is_not_retried(self):
+        """A signing or permission failure must fail fast — retrying cannot fix it,
+        and 403 is exactly what ARC-BUG-10 produced, so a blanket retry would have
+        masked that defect three times over."""
+        from unittest.mock import AsyncMock
+
+        lg = self._logger()
+        lg.async_httpx_client = AsyncMock()
+        lg.async_httpx_client.put.side_effect = self._status_error(403)
+
+        asyncio.run(lg.async_upload_data_to_s3(self._element()))
+
+        assert lg.async_httpx_client.put.await_count == 1
+
+    def test_transient_503_then_success_uploads_without_error(self):
+        from unittest.mock import AsyncMock
+
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.raise_for_status = MagicMock()
+
+        lg = self._logger()
+        lg.async_httpx_client = AsyncMock()
+        lg.async_httpx_client.put.side_effect = [self._status_error(503), ok]
+
+        asyncio.run(lg.async_upload_data_to_s3(self._element()))
+
+        assert lg.async_httpx_client.put.await_count == 2
+        assert lg.handle_callback_failure.call_count == 0
+
+    def test_non_raising_handler_still_retries_via_status_check(self):
+        """The handler is injectable, so a 5xx can also arrive as a returned
+        response. Both paths must retry, which is why the status check is kept."""
+        from unittest.mock import AsyncMock
+
+        five_oh_three = MagicMock()
+        five_oh_three.status_code = 503
+        five_oh_three.raise_for_status = MagicMock(
+            side_effect=self._status_error(503)
+        )
+
+        lg = self._logger()
+        lg.async_httpx_client = AsyncMock()
+        lg.async_httpx_client.put.return_value = five_oh_three
+
+        asyncio.run(lg.async_upload_data_to_s3(self._element()))
+
+        assert lg.async_httpx_client.put.await_count == 3

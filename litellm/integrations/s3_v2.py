@@ -12,6 +12,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional, cast
 from urllib.parse import quote
 
+import httpx
+
 if TYPE_CHECKING:
     from botocore.credentials import Credentials
 
@@ -390,9 +392,37 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
             request_url = url
 
             # Make the request with retry for transient S3 errors (500/503)
+            #
+            # [ARC-BUG-13] The status check has to run on the RAISED error, not on a
+            # returned response. `AsyncHTTPHandler.put` calls `raise_for_status()`
+            # itself and only ever returns a 2xx, so on a 503 it raises before the
+            # `if response.status_code in (500, 503)` line below could ever be
+            # reached: `continue` was dead code and the upload was never retried.
+            # Measured against a real local server returning 503 — the server saw
+            # ONE PUT, not three. (The sync sibling below does not share the bug:
+            # `HTTPHandler.put` returns the response unexamined, so its identical
+            # loop really does retry — measured 3 PUTs. Hence the asymmetry here.)
             max_retries = 3
             for attempt in range(max_retries):
-                response = await self.async_httpx_client.put(request_url, data=json_string, headers=signed_headers)
+                try:
+                    response = await self.async_httpx_client.put(request_url, data=json_string, headers=signed_headers)
+                except httpx.HTTPStatusError as e:
+                    # MaskedHTTPStatusError subclasses HTTPStatusError, so this arm
+                    # catches both and keeps the masked URL in the re-raised error.
+                    status_code = e.response.status_code
+                    if status_code not in (500, 503) or attempt >= max_retries - 1:
+                        raise
+                    wait_time = 2**attempt  # 1s, 2s
+                    verbose_logger.warning(
+                        f"S3 upload returned {status_code}, retrying in {wait_time}s "
+                        f"(attempt {attempt + 1}/{max_retries}) "
+                        f"key={batch_logging_element.s3_object_key}"
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                # A non-raising handler is still possible (it is injectable), so keep
+                # the original status check as a second path rather than assuming the
+                # exception is the only way a 5xx can arrive.
                 if response.status_code in (500, 503) and attempt < max_retries - 1:
                     wait_time = 2**attempt  # 1s, 2s
                     verbose_logger.warning(
