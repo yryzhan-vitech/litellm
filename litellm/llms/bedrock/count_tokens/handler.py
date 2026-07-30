@@ -126,8 +126,12 @@ class BedrockCountTokensHandler(BedrockCountTokensConfig):
                 message=e.response.text,
             )
         except Exception as e:
-            verbose_logger.error(f"Error in CountTokens handler: {str(e)}")
+            # [ARC-BUG-41] log the traceback, not just the message: a litellm.Timeout
+            # surfaced 0.001s into a call Bedrock answered with HTTP 200 was
+            # unattributable from logs alone. type(e).__name__ also names exceptions
+            # whose str() is bare (KeyError -> "'messages'").
+            verbose_logger.exception(f"Error in CountTokens handler: {type(e).__name__}: {e}")
             raise BedrockError(
                 status_code=500,
-                message=f"CountTokens processing error: {str(e)}",
+                message=f"CountTokens processing error: {type(e).__name__}: {e}",
             )

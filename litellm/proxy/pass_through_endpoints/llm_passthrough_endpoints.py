@@ -859,8 +859,13 @@ async def handle_bedrock_count_tokens(
         # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
-        verbose_proxy_logger.error(f"Error in handle_bedrock_count_tokens: {str(e)}")
-        raise HTTPException(status_code=500, detail={"error": f"CountTokens processing error: {str(e)}"})
+        # [ARC-BUG-41] same defect one layer up: without the traceback the 500 cannot
+        # be attributed to a raiser.
+        verbose_proxy_logger.exception(f"Error in handle_bedrock_count_tokens: {type(e).__name__}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={"error": f"CountTokens processing error: {type(e).__name__}: {e}"},
+        )
 
 
 async def bedrock_llm_proxy_route(
