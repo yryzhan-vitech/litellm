@@ -871,6 +871,21 @@ async def proxy_shutdown_event():
     global prisma_client, master_key, user_custom_auth, user_custom_key_generate, user_custom_key_update
     verbose_proxy_logger.info("Shutting down LiteLLM Proxy Server")
     await _drain_spend_buffers_on_shutdown()
+
+    # Drain any in-flight monitor-only guardrail moderation tasks (e.g. Noma
+    # during_call in monitor_mode + block_failures=False) so we preserve
+    # audit data for requests that were still being scanned at shutdown time.
+    # Bounded so a hung upstream cannot delay shutdown indefinitely.
+    # See SRE-3691.
+    try:
+        await proxy_logging_obj.drain_pending_monitor_tasks(timeout=5.0)
+    except Exception as e:
+        # [DO NOT BLOCK shutdown events for this]
+        verbose_proxy_logger.warning(
+            "Error draining pending monitor-only guardrail tasks on shutdown: %s",
+            e,
+        )
+
     if prisma_client:
         verbose_proxy_logger.debug("Disconnecting from Prisma")
         await prisma_client.disconnect()

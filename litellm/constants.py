@@ -156,6 +156,14 @@ DEFAULT_REASONING_EFFORT_MINIMAL_THINKING_BUDGET_GEMINI_2_5_FLASH_LITE = int(
 # Override with LITELLM_MAX_CALLBACKS env var for large deployments (e.g., many teams with guardrails)
 MAX_CALLBACKS = get_env_int("LITELLM_MAX_CALLBACKS", 100)
 
+# Maximum number of in-flight monitor-only guardrail tasks tracked by ProxyLogging.
+# Monitor-only during_call guardrails (monitor_mode=True + block_failures=False) are
+# spawned fire-and-forget so a slow upstream cannot stall the LLM call (SRE-3691).
+# When the upstream is sustained-unavailable, the pending-task set would otherwise
+# grow unboundedly under load (e.g. 100 RPS * N-minute outage) and OOM the worker.
+# Capping is the conservative trade-off: drop the occasional audit record rather
+# than crash the proxy. Override with PROXY_MAX_PENDING_MONITOR_TASKS for tuning.
+PROXY_MAX_PENDING_MONITOR_TASKS = get_env_int("PROXY_MAX_PENDING_MONITOR_TASKS", 1024)
 # Metadata key recording which pre_call guardrails the proxy loop already ran,
 # so the deployment-level hook does not re-run them for the same request
 PRE_CALL_EXECUTED_GUARDRAILS_KEY = "_pre_call_executed_guardrails"

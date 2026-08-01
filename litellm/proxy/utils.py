@@ -26,6 +26,7 @@ from typing import (
     Literal,
     Mapping,
     Optional,
+    Set,
     Sequence,
     Tuple,
     Union,
@@ -36,8 +37,9 @@ from typing import (
 from litellm import _custom_logger_compatible_callbacks_literal
 from litellm.constants import (
     DEFAULT_MODEL_CREATED_AT_TIME,
-    LITELLM_LOGGING_NO_UPSTREAM_LLM_CALL,
     MAX_TEAM_LIST_LIMIT,
+    PROXY_MAX_PENDING_MONITOR_TASKS,
+    LITELLM_LOGGING_NO_UPSTREAM_LLM_CALL,
 )
 from litellm.proxy._types import (
     DB_CONNECTION_ERROR_TYPES,
@@ -105,6 +107,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.prometheus import PrometheusLogger
 from litellm.integrations.SlackAlerting.slack_alerting import SlackAlerting
 from litellm.integrations.SlackAlerting.utils import _add_langfuse_trace_id_to_alert
+from litellm.litellm_core_utils.core_helpers import safe_deep_copy
 from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
@@ -399,6 +402,14 @@ class _CallbackCapabilities:
     resolved_callbacks: Tuple[Any, ...] = field(default_factory=tuple)
 
 
+# Backoff interval for the monitor-only-task-dropped warning. We always emit on
+# the first drop, then once every ``_DROP_WARNING_INTERVAL`` drops thereafter.
+# A monotonic next-threshold field (not "reset to 0") drives this so a sustained
+# outage at 100 RPS can't reset the counter back into the "== 1" arm and
+# log-storm (PR #35 review finding).
+_DROP_WARNING_INTERVAL: int = 100
+
+
 class ProxyLogging:
     """
     Logging/Custom Handlers for proxy.
@@ -447,6 +458,57 @@ class ProxyLogging:
         # Guard flags to prevent duplicate background tasks
         self.daily_report_started: bool = False
         self.hanging_requests_check_started: bool = False
+
+        # Pending fire-and-forget moderation tasks for monitor-only guardrails
+        # (monitor_mode=True AND block_failures=False). These are spawned from
+        # during_call_hook so the LLM call is not gated on a slow upstream
+        # moderation API. We hold strong references so the GC does not collect
+        # them mid-flight, and we drain them on shutdown to preserve audit data.
+        # See SRE-3691 / SRE-3683 for context.
+        self._pending_monitor_tasks: Set[asyncio.Task] = set()
+        # Bound for ``_pending_monitor_tasks`` to prevent unbounded growth
+        # during a sustained upstream outage (e.g. Noma 5xx at 100 RPS).
+        # Overridable via PROXY_MAX_PENDING_MONITOR_TASKS env var. When the
+        # cap is reached, additional monitor-only tasks are dropped (logged)
+        # rather than spawned, preferring lost audit data over an OOM crash.
+        #
+        # Reject non-positive overrides: ``0`` or a negative value would
+        # make ``len(...) >= cap`` true for the very first task, silently
+        # disabling monitor-only guardrails entirely (every cap check
+        # returns True → spawn path skipped → no audit data). Far more
+        # likely a config typo than an intentional kill-switch. PR #35
+        # review finding.
+        max_pending: int = PROXY_MAX_PENDING_MONITOR_TASKS
+        if max_pending <= 0:
+            verbose_proxy_logger.warning(
+                "PROXY_MAX_PENDING_MONITOR_TASKS=%d is non-positive, which "
+                "would silently disable all monitor-only guardrails. "
+                "Coercing to default 1024. Set a positive integer (or "
+                "unset the env var) to silence this warning.",
+                max_pending,
+            )
+            max_pending = 1024
+        self._max_pending_monitor_tasks: int = max_pending
+        # Monotonic per-pod counter of monitor-only tasks dropped because the
+        # cap was hit. Never reset; the throttle uses a separate "next
+        # warning threshold" so we can emit at drop 1, 100, 200, 300, ...
+        # without the counter ever returning to a value the throttle has
+        # already seen. The previous implementation reset the counter inside
+        # the warning branch, which caused the very next drop to match the
+        # ``== 1`` arm and log-storm under a sustained outage (the exact
+        # bug the throttle was meant to prevent). PR #35 review finding.
+        self._dropped_monitor_tasks_since_warning: int = 0
+        # Next drop-counter value at which a warning will fire. Advances by
+        # ``_DROP_WARNING_INTERVAL`` on each emission. Initialized to 1 so
+        # the very first drop always logs; afterwards every 100th drop logs.
+        self._next_dropped_monitor_task_warning_at: int = 1
+        # Set to True once ``drain_pending_monitor_tasks`` starts, so the
+        # spawn path can reject new monitor-only tasks that land
+        # mid-shutdown. Without this, uvicorn's graceful shutdown can
+        # accept a final request → during_call_hook spawns a new monitor
+        # task → drain has already snapshotted ``_pending_monitor_tasks``
+        # and never awaits it. PR #35 review finding.
+        self._shutting_down: bool = False
 
     def startup_event(
         self,
@@ -1564,6 +1626,17 @@ class ProxyLogging:
         except SensitiveDataRouteException:
             status = "intervened"
             raise
+        except asyncio.CancelledError:
+            # [ARC-BUG-20] CancelledError is a BaseException, so without this arm it slips
+            # past `except Exception` and the `finally` emits the initialised
+            # status="success" — a scan killed mid-flight is counted as one that passed.
+            # Reached routinely, not defensively: monitor-only tasks are cancelled by the
+            # shutdown drain, and proxy pods recycle often enough (probe restarts on the
+            # older chart, maxRequestsBeforeRestart on the newer one) for this to be a
+            # normal event rather than an edge case.
+            status = "cancelled"
+            error_type = "CancelledError"
+            raise
         except Exception as e:
             status = "error"
             error_type = type(e).__name__
@@ -1729,6 +1802,307 @@ class ProxyLogging:
     def has_during_call_guardrails() -> bool:
         return ProxyLogging._callback_capabilities().has_guardrail
 
+    @staticmethod
+    def _is_monitor_only_guardrail(callback: Any) -> bool:
+        """
+        Return True iff the guardrail is configured as monitor-only:
+        ``monitor_mode=True`` AND ``block_failures=False``.
+
+        Monitor-only guardrails record violations for audit but explicitly
+        opt out of blocking the user request on the guardrail's own
+        behavior (latency, upstream 5xx, etc.). For during_call/during_mcp_call
+        hooks we therefore spawn their moderation task fire-and-forget instead
+        of awaiting it before the LLM call (SRE-3691).
+
+        ``block_failures`` defaults to True (i.e. blocking) when unset, so a
+        guardrail must explicitly set ``block_failures=False`` to opt in.
+        ``monitor_mode`` defaults to False so it must also be explicitly set.
+        """
+        return getattr(callback, "monitor_mode", False) is True and getattr(callback, "block_failures", True) is False
+
+    @staticmethod
+    def _detach_is_allowed_for_event(event_type: Any, guardrail_name: str) -> bool:
+        """Whether a monitor-only guardrail may be detached for this event type.
+
+        Detaching costs the guardrail's audit record: a fire-and-forget task writes into
+        a snapshot of the request, and the spend-log row is assembled from the live dict
+        after the LLM call returns. That is accepted for the LLM ``during_call`` hook,
+        where the latency it buys back is user-visible on the streaming path and
+        ``pre_call`` still covers most of the same request-side content.
+
+        It is NOT accepted for ``during_mcp_call``, for three reasons.
+
+        It is the only hook that sees the tool arguments a server actually receives:
+        ``pre_mcp_call`` runs BEFORE the rewrite, since ``mcp_server_manager`` reassigns
+        ``arguments`` from the pre-hook result and only then builds the during-hook task.
+        Nothing else inspects the post-rewrite payload.
+
+        It can still enforce. ``block_failures=True`` on this hook must be able to fail a
+        tool call, and a detached task cannot — the decision would arrive after the tool
+        had already run. Excluding MCP keeps that option available without another change.
+
+        Its inline OTEL span fires synchronously, so awaiting is what keeps the timing and
+        outcome attributable to the request that caused them.
+
+        ⚠️ What this does NOT currently buy is a spend-log or S3 record. Measured
+        2026-08-02: ``_create_during_hook_task`` scans a synthetic dict built by
+        ``_convert_mcp_to_llm_format`` that carries no ``metadata`` and no
+        ``litellm_logging_obj``, and the caller discards the task's result, so the audit
+        entry is written to a local that nothing reads. MCP spend-log coverage is 0% both
+        before and after this change — a pre-existing gap in the MCP plumbing, not
+        something the detach caused, and worth its own ticket. Detaching would have made
+        that gap permanent rather than fixable.
+
+        The hook is bounded by ARC-BUG-43's scan deadline instead. That is affordable
+        because an MCP tool call is a discrete request/response rather than a token stream:
+        a bounded wait reads as a slow tool, not as a response stalling mid-sentence.
+        Measured Noma latency on production over 31 days is p99 0.38s with normal weeks
+        peaking below 6s, so the deadline sits well clear of anything observed, and on
+        expiry the guardrail records ``guardrail_failed_to_respond`` — an unscanned call is
+        logged rather than hidden.
+
+        Reassess if MCP traffic ever becomes latency-sensitive; the fix would be to make
+        the audit record reach a sink, not to start detaching.
+        """
+        from litellm.types.guardrails import GuardrailEventHooks
+
+        if event_type != GuardrailEventHooks.during_mcp_call:
+            return True
+
+        verbose_proxy_logger.debug(
+            "Guardrail %s is monitor-only but will be AWAITED: %s is not detachable "
+            "because it is the only audit of post-rewrite MCP tool arguments. Bounded by "
+            "the scan deadline instead.",
+            guardrail_name,
+            GuardrailEventHooks.during_mcp_call.value,
+        )
+        return False
+
+    @staticmethod
+    def _close_coroutines_quietly(*coroutines: Any) -> None:
+        """
+        Close one or more coroutines without raising, so callers can use
+        this as a cleanup hook when a fire-and-forget spawn is skipped
+        (cap reached, loop closed, drain in progress). Closing prevents
+        Python's ``coroutine was never awaited`` RuntimeWarning at GC.
+        """
+        for c in coroutines:
+            close_fn = getattr(c, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+
+    def _spawn_monitor_only_guardrail_task(
+        self,
+        callback: Any,
+        coro: Awaitable[Any],
+    ) -> Optional[asyncio.Task]:
+        """
+        Spawn a fire-and-forget moderation task for a monitor-only guardrail.
+
+        The task is tracked in ``self._pending_monitor_tasks`` so the asyncio
+        event loop holds a strong reference (preventing GC mid-flight) and so
+        ``drain_pending_monitor_tasks`` can await them on shutdown to preserve
+        audit data. A done-callback logs the eventual result distinctly so we
+        can still alert on Noma findings even though the LLM call did not wait.
+
+        Returns the spawned task, or ``None`` if the task was dropped because
+        the pending-task cap (``_max_pending_monitor_tasks``) was reached.
+        Dropping prevents unbounded memory growth during a sustained upstream
+        outage; the moderation coroutine is closed so it does not leak.
+        """
+        guardrail_name = getattr(callback, "guardrail_name", None) or type(callback).__name__
+        # Reject new spawns once drain has started. drain_pending_monitor_tasks
+        # snapshots ``_pending_monitor_tasks`` at entry; any task spawned
+        # after that snapshot is never awaited and the audit record is lost
+        # to no benefit (uvicorn is going to kill the worker anyway).
+        # Closing the coroutine here is cleaner than spawning a task that
+        # will be silently abandoned. PR #35 review finding.
+        if self._shutting_down:
+            verbose_proxy_logger.info(
+                "Refusing to spawn monitor-only guardrail %s: drain in progress (shutdown). Audit record will be lost.",
+                guardrail_name,
+            )
+            self._close_coroutines_quietly(coro)
+            return None
+        # Cap the pending set so a sustained upstream outage cannot OOM the
+        # worker. Trading audit data for proxy availability is the safer call.
+        if len(self._pending_monitor_tasks) >= self._max_pending_monitor_tasks:
+            self._dropped_monitor_tasks_since_warning += 1
+            # Backoff: log when the monotonic drop counter crosses the next
+            # warning threshold. The threshold advances by
+            # ``_DROP_WARNING_INTERVAL`` per emission, so a sustained outage
+            # at 100 RPS emits at drop 1, 100, 200, 300, ... — never the
+            # log-storm the original ``reset to 0 inside the warning branch``
+            # implementation triggered (PR #35 review finding).
+            if self._dropped_monitor_tasks_since_warning >= self._next_dropped_monitor_task_warning_at:
+                verbose_proxy_logger.warning(
+                    "Monitor-only guardrail task dropped: pending=%d cap=%d guardrail=%s dropped_total=%d",
+                    len(self._pending_monitor_tasks),
+                    self._max_pending_monitor_tasks,
+                    guardrail_name,
+                    self._dropped_monitor_tasks_since_warning,
+                )
+                # Advance the threshold to the next multiple of the interval
+                # past the current counter. Using ``+= _DROP_WARNING_INTERVAL``
+                # is fine for steady-state drops, but a burst that overshoots
+                # by >interval (e.g. counter jumps from 1 to 250 between
+                # checks under contention) would otherwise log every drop
+                # until the threshold caught up. ``max(...) + interval``
+                # closes that gap.
+                self._next_dropped_monitor_task_warning_at = (
+                    max(
+                        self._next_dropped_monitor_task_warning_at,
+                        self._dropped_monitor_tasks_since_warning,
+                    )
+                    + _DROP_WARNING_INTERVAL
+                )
+            # Close the unused coroutine so we don't emit a
+            # "coroutine was never awaited" RuntimeWarning.
+            self._close_coroutines_quietly(coro)
+            return None
+        wrapped = self._run_guardrail_with_metrics(callback, coro, "during_call")
+        # Guard create_task against a closing/closed event loop. Requests
+        # that land mid-shutdown (between proxy_shutdown_event start and
+        # uvicorn's request-handler teardown) can hit asyncio.create_task
+        # while the loop is no longer accepting new tasks, raising
+        # RuntimeError. Letting that propagate into asyncio.gather upstream
+        # would 500 an otherwise-valid LLM call.
+        #
+        # PR #35 review finding: a broad ``except RuntimeError`` masked
+        # *every* RuntimeError from ``asyncio.create_task`` — programming
+        # bugs, uvloop-specific errors, future Python additions — turning
+        # them into silent skips. Instead, pre-check the loop with
+        # ``asyncio.get_running_loop().is_closed()`` BEFORE calling
+        # create_task. The specific "loop is closed" case becomes a
+        # quiet skip; any other RuntimeError from create_task propagates
+        # so it can be observed and fixed.
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError as e:
+            # No running loop at all — extremely rare for during_call_hook
+            # (callers always invoke it via ``await``), but defensive
+            # handling here covers the case cleanly.
+            verbose_proxy_logger.warning(
+                "Skipping monitor-only guardrail %s; no running event loop: %s",
+                guardrail_name,
+                e,
+            )
+            self._close_coroutines_quietly(wrapped, coro)
+            return None
+        if running_loop.is_closed():
+            verbose_proxy_logger.warning(
+                "Skipping monitor-only guardrail %s; event loop is closed (request landed mid-shutdown).",
+                guardrail_name,
+            )
+            self._close_coroutines_quietly(wrapped, coro)
+            return None
+        task = asyncio.create_task(
+            wrapped,
+            name=f"monitor_guardrail:{guardrail_name}",
+        )
+        self._pending_monitor_tasks.add(task)
+        task.add_done_callback(lambda t, name=guardrail_name: self._on_monitor_only_task_done(t, name))
+        return task
+
+    def _on_monitor_only_task_done(self, task: asyncio.Task, guardrail_name: str) -> None:
+        """
+        Done-callback for monitor-only moderation tasks.
+
+        Removes the task from the pending set and emits a distinct log line
+        for each terminal state (success, cancelled, exception) so that
+        downstream observability can still alert on Noma findings/timeouts
+        even though the LLM call did not wait for the task.
+        """
+        self._pending_monitor_tasks.discard(task)
+        if task.cancelled():
+            verbose_proxy_logger.info(
+                "Monitor-only guardrail task cancelled: guardrail=%s",
+                guardrail_name,
+            )
+            return
+        exc = task.exception()
+        if exc is not None:
+            verbose_proxy_logger.warning(
+                "Monitor-only guardrail task failed: guardrail=%s error=%s",
+                guardrail_name,
+                exc,
+            )
+            return
+        verbose_proxy_logger.debug(
+            "Monitor-only guardrail task completed: guardrail=%s",
+            guardrail_name,
+        )
+
+    async def drain_pending_monitor_tasks(self, timeout: float = 5.0) -> None:
+        """
+        Await any in-flight monitor-only moderation tasks on shutdown so that
+        Noma (and other monitor-mode guardrails) still receive their audit
+        records for requests in flight when the worker is asked to exit.
+
+        Bounded by ``timeout`` so a hung upstream cannot delay shutdown
+        indefinitely; tasks still pending after the timeout are cancelled
+        and logged.
+        """
+        # Flip the shutdown gate BEFORE snapshotting so any concurrent
+        # spawn calls (e.g. from a request that's still being handled by
+        # uvicorn's graceful drain) get rejected instead of landing
+        # outside our snapshot. PR #35 review finding.
+        self._shutting_down = True
+        # Snapshot — done-callbacks mutate the set as tasks complete.
+        pending = [t for t in self._pending_monitor_tasks if not t.done()]
+        if not pending:
+            return
+        verbose_proxy_logger.info(
+            "Draining %d pending monitor-only guardrail task(s) with timeout=%.1fs",
+            len(pending),
+            timeout,
+        )
+        # Drain in two bounded phases using ``asyncio.wait`` (NOT
+        # ``asyncio.wait_for(asyncio.gather(...))``):
+        #
+        # Phase 1 — natural completion: ``asyncio.wait(..., timeout=)`` blocks
+        # up to ``timeout`` without ever cancelling its argument tasks, so a
+        # task that catches CancelledError can't hang the call.
+        # ``wait_for(gather)`` had to be paired with ``asyncio.shield`` to
+        # get this property, which leaked the gather as a "live in
+        # background" task — relying on uvicorn SIGKILL to clean up. uvicorn
+        # does graceful shutdown FIRST, so SIGKILL is not a reliable backstop.
+        #
+        # Phase 2 — explicit cancel + bounded wait: cancel every task that
+        # didn't finish, then ``asyncio.wait`` again with a tight cleanup
+        # timeout so done-callbacks (which emit the per-task audit log
+        # lines) can fire. Any task that genuinely swallows cancellation
+        # falls out of the second wait's ``not_done`` set; we log it and
+        # return — no background leak because the task is still referenced
+        # by ``_pending_monitor_tasks`` and will be reaped when the
+        # ProxyLogging instance is GC'd at process exit, not when uvicorn
+        # SIGKILLs. PR #35 review finding.
+        _, not_done = await asyncio.wait(pending, timeout=timeout)
+        if not_done:
+            verbose_proxy_logger.warning(
+                "Monitor-only guardrail drain timed out after %.1fs; "
+                "cancelling %d task(s) that did not complete naturally",
+                timeout,
+                len(not_done),
+            )
+            for t in not_done:
+                t.cancel()
+            cleanup_timeout = 1.0
+            _, still_not_done = await asyncio.wait(not_done, timeout=cleanup_timeout)
+            if still_not_done:
+                verbose_proxy_logger.warning(
+                    "Monitor-only guardrail cleanup wait exceeded %.1fs; "
+                    "%d task(s) did not honor cancellation. They remain "
+                    "tracked on ProxyLogging._pending_monitor_tasks and "
+                    "will be GC'd at interpreter exit; no background "
+                    "gather is leaked.",
+                    cleanup_timeout,
+                    len(still_not_done),
+                )
+
     async def during_call_hook(
         self,
         data: dict,
@@ -1736,7 +2110,21 @@ class ProxyLogging:
         call_type: CallTypesLiteral,
     ):
         """
-        Runs the CustomGuardrail's async_moderation_hook() in parallel
+        Runs the CustomGuardrail's async_moderation_hook() in parallel.
+
+        Behavior per guardrail:
+
+        - **Blocking** (default, or ``block_failures=True``): the moderation
+          coroutine is gathered before this method returns, so the LLM call
+          waits for the guardrail to clear. This preserves the existing
+          synchronous semantics for guardrails that are authoritative.
+
+        - **Monitor-only** (``monitor_mode=True`` AND ``block_failures=False``):
+          the moderation coroutine is spawned via ``asyncio.create_task`` and
+          tracked on ``self._pending_monitor_tasks``. This method does NOT
+          await it, so a slow or failing upstream (e.g. Noma 5xx) cannot stall
+          the LLM call. The eventual result is logged when the task completes
+          and any pending tasks are drained on shutdown (SRE-3691).
         """
         # Fast path: skip the entire guardrail scan when no CustomGuardrail
         # callbacks are registered. Saves per-request iteration over
@@ -1744,14 +2132,28 @@ class ProxyLogging:
         # deployments with no guardrails configured.
         if not ProxyLogging._callback_capabilities().has_guardrail:
             return data
-        # Step 1: Collect all guardrail tasks to run in parallel
-        guardrail_tasks = []
+        # Step 1: Collect all guardrail tasks. Blocking guardrails are
+        # awaited via asyncio.gather; monitor-only guardrails are spawned
+        # fire-and-forget so the caller's LLM call is not blocked on them.
+        guardrail_tasks: List[Awaitable[Any]] = []
 
         for callback in litellm.callbacks:
             if isinstance(callback, CustomGuardrail):
                 ################################################################
                 # Check if guardrail should be run for GuardrailEventHooks.during_call hook
                 ################################################################
+                from litellm.types.guardrails import GuardrailEventHooks
+
+                # Resolved before the V1/V2 split so the detach decision below can read
+                # it on either path: V1 guardrails never set it, and defaulting them to
+                # during_call would let an MCP tool call be detached as if it were an LLM
+                # call. ``call_type`` is the only signal available on the V1 path.
+                event_type = (
+                    GuardrailEventHooks.during_mcp_call
+                    if call_type == CallTypes.call_mcp_tool.value
+                    else GuardrailEventHooks.during_call
+                )
+                guardrail_name = getattr(callback, "guardrail_name", None) or type(callback).__name__
 
                 # V1 implementation - backwards compatibility
                 if callback.event_hook is None and hasattr(callback, "moderation_check"):
@@ -1759,12 +2161,6 @@ class ProxyLogging:
                         return
                 else:
                     # Main - V2 Guardrails implementation
-                    from litellm.types.guardrails import GuardrailEventHooks
-
-                    event_type = GuardrailEventHooks.during_call
-                    if call_type == CallTypes.call_mcp_tool.value:
-                        event_type = GuardrailEventHooks.during_mcp_call
-
                     if callback.should_run_guardrail(data=data, event_type=event_type) is not True:
                         continue
                 # Convert user_api_key_dict to proper format for async_moderation_hook
@@ -1772,35 +2168,92 @@ class ProxyLogging:
                     user_api_key_auth_dict = self._convert_user_api_key_auth_to_dict(user_api_key_dict)
                 else:
                     user_api_key_auth_dict = user_api_key_dict
-                # Add task to list for parallel execution
+
+                # Monitor-only guardrails (monitor_mode + block_failures=False)
+                # are spawned fire-and-forget. They MUST receive a snapshot
+                # of ``data`` rather than the live request dict, for two
+                # reasons:
+                #  1) ``data["guardrail_to_apply"] = callback`` is set in
+                #     the next branch. With the live dict, the next loop
+                #     iteration would overwrite that field before the
+                #     fire-and-forget task observes it — the spawned task
+                #     would see a sibling callback's value (or, after the
+                #     loop ends, no value at all).
+                #  2) After during_call_hook returns, the LLM call mutates
+                #     ``data["deployment"]`` and ``data["_hidden_params"]``
+                #     and the post-call hooks may pop entries. A slow
+                #     monitor-only moderation task would otherwise observe
+                #     those fields in their mutated, mid-call state.
+                # safe_deep_copy handles non-pickleable values (tracing
+                # spans, locks, clients) by falling back to the original
+                # reference per top-level key. PR #35 review finding
+                # (Angles A/B/D/E).
+                #
+                # ⚠️ ACCEPTED TRADE-OFF, measured 2026-08-01. The snapshot also
+                # isolates ``metadata``, where the guardrail appends its
+                # ``standard_logging_guardrail_information`` entry — and the spend log
+                # reads that list off the LIVE dict. So a monitor-only during_call
+                # scan writes its audit record to a copy nothing reads: spend-log
+                # coverage for this hook is 0%, not intermittent.
+                #
+                # This is inherent to fire-and-forget, not a fixable addressing bug.
+                # The spend-log row is assembled after the LLM call returns; a scan we
+                # deliberately do not wait for has produced no result by then.
+                # Re-pointing the audit list at the live one was tried and rejected:
+                # it converts a deterministic, documentable loss into a race that
+                # loses the record precisely when scans are slow (measured: scan 2.0s
+                # vs LLM 0.2s → absent at row-build; scan 0.1s vs LLM 2.0s → present),
+                # which cannot be monitored or reasoned about.
+                #
+                # Accepted for the LLM ``during_call`` hook only, and NOT because the
+                # scan is redundant — an earlier framing that said so was measured and
+                # found wrong. ``during_call`` scans the request at a LATER point in the
+                # mutation pipeline than ``pre_call`` does: any pre_call callback ordered
+                # after the guardrail mutates the messages it then reads, and a key that
+                # opts out of the pre_call guardrail leaves during_call as the ONLY
+                # request-side scan. So a real, if narrow, coverage delta goes unaudited.
+                #
+                # It is accepted because that delta is bounded and the latency it buys
+                # back is on the streaming path, where a stalled Noma is user-visible
+                # mid-response. ``pre_call`` and ``post_call`` stay awaited and keep
+                # writing their records — including an explicit
+                # ``guardrail_failed_to_respond`` entry when ARC-BUG-43's deadline fires,
+                # so a scan that did not happen is recorded rather than hidden.
+                #
+                # ⚠️ MCP IS DELIBERATELY EXCLUDED, see _detach_is_allowed_for_event.
+                # See ARC-BUG-20 / SRE-3691, and ARC-BUG-43 for the scan deadline.
+                is_monitor_only = self._is_monitor_only_guardrail(callback) and self._detach_is_allowed_for_event(
+                    event_type=event_type, guardrail_name=guardrail_name
+                )
+                moderation_data = safe_deep_copy(data) if is_monitor_only else data
+
+                # Build the moderation coroutine for this callback
                 if (
                     "apply_guardrail" in type(callback).__dict__
                     and user_api_key_dict is not None
                     and not getattr(callback, "use_native_during_call_hook", False)
                 ):
-                    data["guardrail_to_apply"] = callback
-                    guardrail_task = self._run_guardrail_with_metrics(
-                        callback,
-                        unified_guardrail.async_moderation_hook(
-                            user_api_key_dict=user_api_key_dict,
-                            data=data,
-                            call_type=call_type,
-                        ),
-                        "during_call",
+                    moderation_data["guardrail_to_apply"] = callback
+                    moderation_coro = unified_guardrail.async_moderation_hook(
+                        user_api_key_dict=user_api_key_dict,
+                        data=moderation_data,
+                        call_type=call_type,
                     )
                 else:
-                    guardrail_task = self._run_guardrail_with_metrics(
-                        callback,
-                        callback.async_moderation_hook(
-                            data=data,
-                            user_api_key_dict=user_api_key_auth_dict,  # type: ignore
-                            call_type=call_type,  # type: ignore
-                        ),
-                        "during_call",
+                    moderation_coro = callback.async_moderation_hook(
+                        data=moderation_data,
+                        user_api_key_dict=user_api_key_auth_dict,  # type: ignore
+                        call_type=call_type,  # type: ignore
                     )
-                guardrail_tasks.append(guardrail_task)
 
-        # Step 2: Run all guardrail tasks in parallel
+                if is_monitor_only:
+                    self._spawn_monitor_only_guardrail_task(callback, moderation_coro)
+                else:
+                    guardrail_tasks.append(
+                        self._run_guardrail_with_metrics(callback, moderation_coro, event_type.value)
+                    )
+
+        # Step 2: Run all blocking guardrail tasks in parallel
         if guardrail_tasks:
             try:
                 await asyncio.gather(*guardrail_tasks)
