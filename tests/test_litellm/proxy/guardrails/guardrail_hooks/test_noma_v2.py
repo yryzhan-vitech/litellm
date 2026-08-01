@@ -1,8 +1,15 @@
+import time
+import asyncio
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+import openai
 import pytest
 
+import litellm
+
+from litellm.constants import HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.guardrails.guardrail_hooks.noma import (
     NomaV2Guardrail,
@@ -937,3 +944,514 @@ class TestNomaV2StreamingKnobs:
         await _drain_through_unified_guardrail(guardrail, chunk_count=4, scanned_texts=scanned_texts)
 
         assert scanned_texts == ["assembled"]
+
+
+class TestNomaV2ScanTimeout:
+    """[ARC-BUG-43] a single scan must carry an explicit deadline.
+
+    Without one the POST inherits the shared httpx client default
+    (COMPLETION_HTTP_FALLBACK_SECONDS, 600s). during_call_hook is gathered in
+    parallel with the LLM call, so gather waits for the slowest member: a hung
+    Noma holds the request open long after the model answered.
+    """
+
+    def test_scan_timeout_defaults_to_constant(self, noma_v2_guardrail):
+        from litellm.constants import NOMA_SCAN_TIMEOUT_SECONDS
+
+        assert noma_v2_guardrail.scan_timeout == NOMA_SCAN_TIMEOUT_SECONDS
+
+    def test_scan_timeout_accepts_explicit_value(self):
+        guardrail = NomaV2Guardrail(
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            scan_timeout=2.5,
+            guardrail_name="test-noma-v2-guardrail",
+            event_hook="during_call",
+        )
+        assert guardrail.scan_timeout == 2.5
+
+    def test_scan_timeout_coerces_config_string(self):
+        # config values arrive uncoerced (extra="allow"), same as the streaming knobs
+        guardrail = NomaV2Guardrail(
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            scan_timeout="2.5",
+            guardrail_name="test-noma-v2-guardrail",
+            event_hook="during_call",
+        )
+        assert guardrail.scan_timeout == 2.5
+
+    @pytest.mark.parametrize(
+        "bad",
+        [0, -1, True, "abc", "inf", "nan", "1e400", 0.05, 600, "600"],
+        ids=[
+            "zero", "negative", "bool", "non-numeric", "inf", "nan", "overflow-to-inf",
+            "below-floor", "above-ceiling", "above-ceiling-str",
+        ],
+    )
+    def test_scan_timeout_rejects_non_positive_non_finite_and_sub_floor(self, bad):
+        # inf passes `> 0` and nan fails every comparison, so a bare `<= 0` guard
+        # admits both; a sub-floor value fails every scan before it reaches Noma.
+        with pytest.raises(ValueError, match="scan_timeout"):
+            NomaV2Guardrail(
+                api_key="test-api-key",
+                api_base="https://api.test.noma.security/",
+                scan_timeout=bad,
+                guardrail_name="test-noma-v2-guardrail",
+                event_hook="during_call",
+            )
+
+    @pytest.mark.asyncio
+    async def test_scan_passes_timeout_to_http_post(self, noma_v2_guardrail):
+        # The payload assertion is the point: a call-count check would pass even
+        # if timeout were dropped on the floor.
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = "{}"
+        mock_response.json.return_value = {"verdict": {"allowed": True}}
+        mock_response.raise_for_status.return_value = None
+        mock_post = AsyncMock(return_value=mock_response)
+
+        with patch.object(noma_v2_guardrail.async_handler, "post", mock_post):
+            await noma_v2_guardrail._call_noma_scan(payload={"probe": "value"})
+
+        # A bare float would set all four httpx budgets, replacing the 5s connect
+        # handshake with scan_timeout and LENGTHENING the tail for an unreachable Noma.
+        passed = mock_post.await_args.kwargs["timeout"]
+        assert isinstance(passed, httpx.Timeout)
+        assert passed.read == noma_v2_guardrail.scan_timeout
+        assert passed.connect == min(
+            HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS, noma_v2_guardrail.scan_timeout
+        )
+
+    @pytest.mark.asyncio
+    async def test_timeout_does_not_block_request_and_is_audited(self):
+        """A scan that times out must return the inputs unchanged and still record
+        an audit entry, so the spend log carries the timeout instead of silently
+        losing the scan."""
+        import httpx
+
+        guardrail = NomaV2Guardrail(
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            monitor_mode=True,
+            block_failures=False,
+            scan_timeout=1.0,
+            guardrail_name="noma-during-call",
+            event_hook="during_call",
+            default_on=True,
+        )
+        mock_post = AsyncMock(side_effect=httpx.ReadTimeout("simulated"))
+        inputs = {"texts": ["hello"]}
+        request_data = {"metadata": {"user_api_key": "sk-test"}}
+
+        with patch.object(guardrail.async_handler, "post", mock_post):
+            result = await guardrail.apply_guardrail(
+                inputs=inputs,
+                input_type="request",
+                request_data=request_data,
+            )
+
+        assert result == inputs
+        entries = request_data["metadata"]["standard_logging_guardrail_information"]
+        assert [e["guardrail_status"] for e in entries] == ["guardrail_failed_to_respond"]
+
+    @pytest.mark.asyncio
+    async def test_initialize_guardrail_v2_forwards_scan_timeout(self):
+        params = LitellmParams(
+            guardrail="noma",
+            mode="during_call",
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            use_v2=True,
+            scan_timeout=3.5,
+        )
+        callback = initialize_guardrail_v2(
+            litellm_params=params,
+            guardrail={"guardrail_name": "noma-during-call"},
+        )
+        assert callback.scan_timeout == 3.5
+
+    @pytest.mark.asyncio
+    async def test_scan_timeout_is_a_total_deadline_not_per_read(self):
+        """The transport's own timeout is per-I/O-operation: its read budget resets on
+        every byte, so a peer that dribbles the response indefinitely keeps the scan
+        alive. Measured at 4x the configured value before asyncio.wait_for was added,
+        and reported as a SUCCESS."""
+        guardrail = NomaV2Guardrail(
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            scan_timeout=0.3,
+            guardrail_name="noma-during-call",
+            event_hook="during_call",
+        )
+
+        async def _never_finishes(*args, **kwargs):
+            await asyncio.sleep(30)
+            raise AssertionError("unreachable: the deadline must fire first")
+
+        start = time.monotonic()
+        with patch.object(guardrail.async_handler, "post", _never_finishes):
+            with pytest.raises(asyncio.TimeoutError):
+                await guardrail._call_noma_scan(payload={"probe": "value"})
+        assert time.monotonic() - start < 5.0
+
+    def test_env_default_is_validated_not_trusted(self, monkeypatch):
+        """get_env_float only rejects non-finite values, so a stray
+        NOMA_SCAN_TIMEOUT_SECONDS=-5 would reach the transport and fail every scan in
+        ~0ms. With block_failures=False that is swallowed: full traffic, zero AIDR
+        coverage, guardrails still reported as enabled."""
+        import litellm.proxy.guardrails.guardrail_hooks.noma.noma_v2 as noma_v2_module
+
+        for poisoned in (-5.0, 0.0, 1e-9):
+            monkeypatch.setattr(noma_v2_module, "NOMA_SCAN_TIMEOUT_SECONDS", poisoned)
+            with pytest.raises(ValueError, match="scan_timeout"):
+                noma_v2_module._coerce_scan_timeout(None)
+
+    def test_generic_timeout_param_is_honoured(self):
+        """LitellmParams.timeout is the documented generic knob four sibling guardrails
+        already consume. An operator who sets it must not get silence."""
+        params = LitellmParams(
+            guardrail="noma",
+            mode="during_call",
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            use_v2=True,
+            timeout=2.0,
+        )
+        callback = initialize_guardrail_v2(
+            litellm_params=params, guardrail={"guardrail_name": "noma-during-call"}
+        )
+        assert callback.scan_timeout == 2.0
+
+    def test_scan_timeout_wins_over_generic_timeout(self):
+        params = LitellmParams(
+            guardrail="noma",
+            mode="during_call",
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            use_v2=True,
+            timeout=2.0,
+            scan_timeout=7.0,
+        )
+        callback = initialize_guardrail_v2(
+            litellm_params=params, guardrail={"guardrail_name": "noma-during-call"}
+        )
+        assert callback.scan_timeout == 7.0
+
+    def test_default_is_well_under_the_shared_client_budget(self):
+        """Pins the value against a regression to the 600s it exists to replace."""
+        from litellm.constants import (
+            COMPLETION_HTTP_FALLBACK_SECONDS,
+            NOMA_SCAN_TIMEOUT_SECONDS,
+        )
+
+        assert NOMA_SCAN_TIMEOUT_SECONDS == 10.0
+        assert NOMA_SCAN_TIMEOUT_SECONDS < COMPLETION_HTTP_FALLBACK_SECONDS / 10
+
+    @pytest.mark.asyncio
+    async def test_timeout_audit_entry_is_a_dict_and_flags_the_timeout(self):
+        """With block_failures=False the exception is swallowed, so
+        _run_guardrail_with_metrics records status="success" and
+        litellm_guardrail_errors_total never increments. The audit entry is the only place a
+        timeout is distinguishable, so it must say so explicitly — and be a dict, since
+        ConnectTimeout stringifies to '' and str(e) would leave no explanation at all."""
+        import httpx
+
+        guardrail = NomaV2Guardrail(
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            monitor_mode=True,
+            block_failures=False,
+            scan_timeout=0.2,
+            guardrail_name="noma-during-call",
+            event_hook="during_call",
+        )
+        request_data = {"metadata": {"user_api_key": "sk-test"}}
+
+        # Raised only after the budget has elapsed: an instant ConnectTimeout is a
+        # connection failure, not an expiry, and is covered separately.
+        async def _expire_then_raise(*args, **kwargs):
+            await asyncio.sleep(0.25)
+            raise httpx.ConnectTimeout("")
+
+        with patch.object(guardrail.async_handler, "post", _expire_then_raise):
+            await guardrail.apply_guardrail(
+                inputs={"texts": ["hello"]}, input_type="request", request_data=request_data
+            )
+
+        entry = request_data["metadata"]["standard_logging_guardrail_information"][0]
+        assert entry["guardrail_status"] == "guardrail_failed_to_respond"
+        response = entry["guardrail_response"]
+        assert isinstance(response, dict)
+        assert response["timed_out"] is True
+        assert response["scan_timeout_seconds"] == 0.2
+        assert response["elapsed_seconds"] >= 0.2
+        # The entry must explain itself even for an exception whose str() is empty — here
+        # asyncio.wait_for wins the race and raises TimeoutError(""), so `detail` falls back
+        # to the type name rather than being blank.
+        assert response["detail"] == response["error"]
+        assert response["detail"]
+
+    @pytest.mark.asyncio
+    async def test_non_timeout_failure_is_not_flagged_as_timed_out(self):
+        guardrail = NomaV2Guardrail(
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            monitor_mode=True,
+            block_failures=False,
+            guardrail_name="noma-during-call",
+            event_hook="during_call",
+        )
+        request_data = {"metadata": {}}
+
+        with patch.object(guardrail.async_handler, "post", AsyncMock(side_effect=ValueError("bad json"))):
+            await guardrail.apply_guardrail(
+                inputs={"texts": ["hello"]}, input_type="request", request_data=request_data
+            )
+
+        response = request_data["metadata"]["standard_logging_guardrail_information"][0][
+            "guardrail_response"
+        ]
+        assert response["timed_out"] is False
+        assert response["error"] == "ValueError"
+
+    def test_config_model_floor_matches_the_runtime_floor(self):
+        """A looser pydantic bound would accept a value that then fails pod startup."""
+        import pydantic
+
+        from litellm.constants import NOMA_MIN_SCAN_TIMEOUT_SECONDS
+
+        below = NOMA_MIN_SCAN_TIMEOUT_SECONDS / 2
+        with pytest.raises(pydantic.ValidationError):
+            NomaV2GuardrailConfigModel(scan_timeout=below)
+        with pytest.raises(ValueError):
+            NomaV2Guardrail(
+                api_key="test-api-key",
+                api_base="https://api.test.noma.security/",
+                scan_timeout=below,
+                guardrail_name="test-noma-v2-guardrail",
+                event_hook="during_call",
+            )
+
+    @pytest.mark.parametrize(
+        "exc_factory",
+        [
+            pytest.param(lambda: asyncio.TimeoutError(), id="asyncio-TimeoutError"),
+            pytest.param(lambda: httpx.ReadTimeout("read"), id="httpx-ReadTimeout"),
+            pytest.param(lambda: httpx.ConnectTimeout(""), id="httpx-ConnectTimeout"),
+            pytest.param(lambda: httpx.PoolTimeout("pool"), id="httpx-PoolTimeout"),
+            pytest.param(
+                lambda: litellm.Timeout(message="timed out", model="m", llm_provider="p"),
+                id="litellm-Timeout",
+            ),
+            pytest.param(
+                lambda: openai.APITimeoutError(request=httpx.Request("POST", "https://x.invalid")),
+                id="openai-APITimeoutError",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_every_timeout_type_is_recognised_as_timeout_shaped(self, exc_factory):
+        """All three hierarchies must be recognised, litellm.Timeout included.
+
+        The shared AsyncHTTPHandler catches httpx timeouts and re-raises litellm.Timeout,
+        which subclasses NEITHER asyncio.TimeoutError NOR httpx.TimeoutException. Because
+        connect is pinned below scan_timeout, that is the type which actually arrives for an
+        unreachable Noma, so omitting it left the marker silent on 46 real events.
+
+        Recognition alone does not make it a deadline — see
+        test_fast_failure_is_not_classified_as_a_deadline. Here the exception is raised only
+        after the budget has elapsed, so both conditions hold.
+        """
+        guardrail = NomaV2Guardrail(
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            monitor_mode=True,
+            block_failures=False,
+            scan_timeout=0.2,
+            guardrail_name="noma-pre-call",
+            event_hook="pre_call",
+        )
+        request_data = {"metadata": {}}
+
+        async def _expire_then_raise(*args, **kwargs):
+            await asyncio.sleep(0.25)
+            raise exc_factory()
+
+        with patch.object(guardrail.async_handler, "post", _expire_then_raise):
+            await guardrail.apply_guardrail(
+                inputs={"texts": ["hello"]}, input_type="request", request_data=request_data
+            )
+
+        entry = request_data["metadata"]["standard_logging_guardrail_information"][0]
+        assert entry["guardrail_status"] == "guardrail_failed_to_respond"
+        assert entry["guardrail_response"]["timed_out"] is True
+        assert entry["guardrail_response"]["elapsed_seconds"] >= 0.2
+
+    @pytest.mark.asyncio
+    async def test_fast_failure_is_not_classified_as_a_deadline(self):
+        """A timeout-TYPED exception that arrives instantly is a connection failure, not an
+        expiry, and must not be filed as one.
+
+        The HTTP layer re-raises litellm.Timeout for a dead pooled keep-alive too — its own
+        message says "time taken=0.001 seconds". Keying on the type alone marked 74 such
+        events in two hours as deadline expiries, the longest having taken 0.12s against a
+        10s budget, which buried the real signal in identical-looking noise.
+        """
+        guardrail = NomaV2Guardrail(
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            monitor_mode=True,
+            block_failures=False,
+            scan_timeout=10.0,
+            guardrail_name="noma-pre-call",
+            event_hook="pre_call",
+        )
+        request_data = {"metadata": {}}
+        instant = litellm.Timeout(
+            message="Connection timed out. time taken=0.001 seconds", model="m", llm_provider="p"
+        )
+
+        with patch.object(guardrail.async_handler, "post", AsyncMock(side_effect=instant)):
+            await guardrail.apply_guardrail(
+                inputs={"texts": ["hello"]}, input_type="request", request_data=request_data
+            )
+
+        response = request_data["metadata"]["standard_logging_guardrail_information"][0][
+            "guardrail_response"
+        ]
+        assert response["timed_out"] is False, "an instant failure is not a deadline expiry"
+        assert response["elapsed_seconds"] < 1.0
+        assert response["scan_timeout_seconds"] == 10.0
+
+    @pytest.mark.asyncio
+    async def test_cancelled_scan_is_not_audited_as_success(self):
+        """CancelledError is a BaseException, so without its own arm it skips
+        `except Exception` and the `finally` records the initial "success" — a scan killed
+        mid-flight would be audited as having passed. ARC-BUG-20's shutdown drain cancels
+        in-flight monitor tasks on every restart, so this is routine."""
+        guardrail = NomaV2Guardrail(
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            monitor_mode=True,
+            block_failures=False,
+            guardrail_name="noma-during-call",
+            event_hook="during_call",
+        )
+        request_data = {"metadata": {}}
+
+        async def _hang(*args, **kwargs):
+            await asyncio.sleep(30)
+
+        with patch.object(guardrail.async_handler, "post", _hang):
+            task = asyncio.create_task(
+                guardrail.apply_guardrail(
+                    inputs={"texts": ["hello"]}, input_type="request", request_data=request_data
+                )
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        entry = request_data["metadata"]["standard_logging_guardrail_information"][0]
+        assert entry["guardrail_status"] == "guardrail_failed_to_respond"
+        assert entry["guardrail_response"]["error"] == "CancelledError"
+        assert entry["guardrail_response"]["timed_out"] is False
+
+    def test_explicit_zero_scan_timeout_raises_rather_than_falling_back(self):
+        """`or` would let an explicit 0 fall through to `timeout` (or the default), so a
+        typo would silently become a working budget instead of the documented error."""
+        params = LitellmParams(
+            guardrail="noma",
+            mode="during_call",
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            use_v2=True,
+            scan_timeout=0,
+            timeout=5.0,
+        )
+        with pytest.raises(ValueError, match="scan_timeout"):
+            initialize_guardrail_v2(
+                litellm_params=params, guardrail={"guardrail_name": "noma-during-call"}
+            )
+
+    def test_generic_timeout_of_600_does_not_restore_the_600s_budget(self):
+        """`timeout: 600` is the exact budget this deadline exists to remove. Superseded by
+        the clamp: raising would break an existing, previously-inert config, so the value is
+        clamped to the ceiling instead — the 600s budget is still not restored."""
+        params = LitellmParams(
+            guardrail="noma",
+            mode="pre_call",
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            use_v2=True,
+            timeout=600.0,
+        )
+        callback = initialize_guardrail_v2(
+            litellm_params=params, guardrail={"guardrail_name": "noma-pre-call"}
+        )
+        from litellm.constants import NOMA_MAX_SCAN_TIMEOUT_SECONDS
+
+        assert callback.scan_timeout == NOMA_MAX_SCAN_TIMEOUT_SECONDS
+        assert callback.scan_timeout < 600.0
+
+
+    @pytest.mark.parametrize(
+        "generic_timeout,expected",
+        [(600.0, 60.0), (0.001, 0.1), (5.0, 5.0)],
+        ids=["above-ceiling-clamped", "below-floor-clamped", "in-range-kept"],
+    )
+    def test_out_of_range_generic_timeout_is_clamped_not_fatal(self, generic_timeout, expected):
+        """`timeout` is the shared generic knob, and it was legal-and-inert here before this
+        deadline existed. Raising on it would turn an existing config into a pod that never
+        becomes ready — and because the guardrail registry re-initialises DB-stored
+        guardrails on poll, an Admin-UI edit could break a RUNNING pod. Clamp with a
+        warning; keep raising only for `scan_timeout`, which is set deliberately."""
+        params = LitellmParams(
+            guardrail="noma",
+            mode="pre_call",
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            use_v2=True,
+            timeout=generic_timeout,
+        )
+        callback = initialize_guardrail_v2(
+            litellm_params=params, guardrail={"guardrail_name": "noma-pre-call"}
+        )
+        assert callback.scan_timeout == expected
+
+    def test_non_timeout_failure_log_does_not_carry_the_exception_text(self, caplog):
+        """The container log goes to CloudWatch, which must stay free of PHI. str(e) can
+        carry request content (a ValueError echoing the prompt, an HTTPStatusError carrying
+        the tenant URL), so the log line names the exception TYPE only. The full text stays
+        in the audit entry, which lands in the spend log and S3 — the PHI-bearing store."""
+        import logging
+
+        guardrail = NomaV2Guardrail(
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            monitor_mode=True,
+            block_failures=False,
+            guardrail_name="noma-pre-call",
+            event_hook="pre_call",
+        )
+        secret = "patient MRN 12345 has a diagnosis"
+        request_data = {"metadata": {}}
+
+        with caplog.at_level(logging.ERROR):
+            with patch.object(
+                guardrail.async_handler, "post", AsyncMock(side_effect=ValueError(secret))
+            ):
+                asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+                    guardrail.apply_guardrail(
+                        inputs={"texts": ["hi"]}, input_type="request", request_data=request_data
+                    )
+                )
+
+        assert secret not in caplog.text, "PHI must not reach the container log"
+        assert "ValueError" in caplog.text
+        # ...but the audit record, which goes to the PHI-bearing store, keeps the detail.
+        entry = request_data["metadata"]["standard_logging_guardrail_information"][0]
+        assert secret in entry["guardrail_response"]["detail"]

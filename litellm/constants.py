@@ -164,6 +164,33 @@ MAX_CALLBACKS = get_env_int("LITELLM_MAX_CALLBACKS", 100)
 # Capping is the conservative trade-off: drop the occasional audit record rather
 # than crash the proxy. Override with PROXY_MAX_PENDING_MONITOR_TASKS for tuning.
 PROXY_MAX_PENDING_MONITOR_TASKS = get_env_int("PROXY_MAX_PENDING_MONITOR_TASKS", 1024)
+
+# Wall-clock deadline for a single Noma AIDR scan. Without one the scan inherits the
+# shared httpx client budget (COMPLETION_HTTP_FALLBACK_SECONDS, 600s read), so a hung
+# Noma endpoint holds the request open long after the LLM has answered:
+# during_call_hook is gathered in parallel with the LLM call, and gather waits for the
+# slowest member. On expiry the guardrail's own error path decides the outcome -
+# block_failures=False returns the inputs unchanged and records
+# guardrail_failed_to_respond, so the audit trail keeps the timeout instead of
+# silently dropping the scan. Enforced with asyncio.wait_for, because the transport's
+# own timeout is per-I/O-operation and its read budget resets on every byte received.
+NOMA_SCAN_TIMEOUT_SECONDS: float = get_env_float("NOMA_SCAN_TIMEOUT_SECONDS", 10.0)
+
+# Floor for the above. A sub-millisecond deadline fails every scan before it can reach
+# Noma, and with block_failures=False that is swallowed: the proxy would serve all
+# traffic at full speed with zero AIDR coverage while still reporting its guardrails as
+# enabled, and the audit trail would be indistinguishable from a Noma outage. Rejecting
+# such a value turns a silent kill switch into a startup error.
+NOMA_MIN_SCAN_TIMEOUT_SECONDS: float = 0.1
+
+# Ceiling for the same knob. Without one, `timeout: 600` in guardrail config silently
+# restores the exact budget this deadline exists to remove — and it arrives through the
+# documented generic `timeout` field, so an operator would have no reason to read it as a
+# mistake. 60s sits far above anything measured (production p99 0.38s over 53k scans; the
+# only two cases past 30s in 31 days were Noma outages, not slow scans) while still
+# bounding the tail well under the 600s it replaces.
+NOMA_MAX_SCAN_TIMEOUT_SECONDS: float = 60.0
+
 # Metadata key recording which pre_call guardrails the proxy loop already ran,
 # so the deployment-level hook does not re-run them for the same request
 PRE_CALL_EXECUTED_GUARDRAILS_KEY = "_pre_call_executed_guardrails"
