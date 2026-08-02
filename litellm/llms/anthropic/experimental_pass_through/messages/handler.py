@@ -44,6 +44,7 @@ from ..utils import is_reasoning_auto_summary_enabled
 from ..adapters.handler import LiteLLMMessagesToCompletionTransformationHandler
 from ..responses_adapters.handler import LiteLLMMessagesToResponsesAPIHandler
 from .interceptors import get_messages_interceptors
+from .interceptors.advisor import resolve_advisor_gate_provider
 from .utils import AnthropicMessagesRequestUtils, mock_response
 
 # Providers that are routed directly to the OpenAI Responses API instead of
@@ -305,15 +306,22 @@ async def anthropic_messages(
     # Run registered MessagesInterceptors (e.g. advisor orchestration loop).
     # Named params on `anthropic_messages` are bound to locals, not `**kwargs`,
     # so forward them explicitly — otherwise interceptor sub-calls drop them.
+    #
+    # [ARC-BUG-16] Gate on the deployment provider, not the bare model alias. A proxy alias
+    # such as "claude-sonnet-4-6" name-infers to "anthropic" via get_llm_provider() but may
+    # map to a bedrock/... deployment; gating on the alias treats the request as
+    # advisor-native and skips orchestration, leaking the advisor tool_use back to the
+    # client. See resolve_advisor_gate_provider().
+    interceptor_provider = resolve_advisor_gate_provider(model, custom_llm_provider, tools)
     for interceptor in get_messages_interceptors():
-        if interceptor.can_handle(tools, custom_llm_provider):
+        if interceptor.can_handle(tools, interceptor_provider):
             return await interceptor.handle(
                 model=model,
                 messages=messages,
                 tools=tools,
                 stream=original_stream,
                 max_tokens=max_tokens,
-                custom_llm_provider=custom_llm_provider,
+                custom_llm_provider=interceptor_provider,
                 api_key=api_key,
                 api_base=api_base,
                 metadata=metadata,

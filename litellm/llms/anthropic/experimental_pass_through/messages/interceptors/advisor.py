@@ -19,6 +19,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 import litellm
 import litellm.constants as _c
+from litellm._logging import verbose_logger
 from litellm.litellm_core_utils.url_utils import validate_url
 from litellm.llms.anthropic.common_utils import strip_advisor_blocks_from_messages
 from litellm.types.llms.anthropic_messages.anthropic_response import (
@@ -97,10 +98,26 @@ class AdvisorOrchestrationHandler(MessagesInterceptor):
         metadata_base: Dict = dict(kwargs.pop("metadata", None) or {})
         iteration = 0
 
+        # [ARC-BUG-16] Resolve the EXECUTOR alias too, for the same reason as the advisor
+        # leg below: this loop reaches _call_messages_handler directly, so nothing between
+        # here and the provider re-resolves the alias.
+        #
+        # This became load-bearing the moment the gate started resolving providers. Before,
+        # a Bedrock-routed alias was mis-gated as advisor-native and orchestration was
+        # skipped entirely, so this leg never ran with a non-Anthropic provider. Now it
+        # does — and dispatching the bare alias with custom_llm_provider="bedrock" makes the
+        # Bedrock transform build its URL from the alias string
+        # (.../model/claude-sonnet-4-6/invoke), which 400s, and drops the deployment's
+        # region so it silently defaults to us-east-1. Fixing the gate without this would
+        # trade a leaked tool_use for a hard failure on the same request class.
+        resolved_executor_model, executor_routing_params = _resolve_advisor_model_via_router(model)
+        # An explicit kwarg from the caller wins over a deployment default.
+        executor_routing_params = {k: v for k, v in executor_routing_params.items() if k not in kwargs}
+
         while True:
             # --- Executor call (always non-streaming) ---
             executor_response: AnthropicMessagesResponse = await _call_messages_handler(
-                model=model,
+                model=resolved_executor_model,
                 messages=current_messages,
                 tools=executor_tools,
                 stream=False,
@@ -111,6 +128,7 @@ class AdvisorOrchestrationHandler(MessagesInterceptor):
                     "advisor_sub_call": False,
                     "parent_request_id": parent_request_id,
                 },
+                **executor_routing_params,
                 **kwargs,
             )
 
@@ -133,13 +151,23 @@ class AdvisorOrchestrationHandler(MessagesInterceptor):
             advisor_messages = _build_advisor_context(current_messages, executor_response, advisor_use_block)
 
             # --- Advisor sub-call (always non-streaming, no tools) ---
+            # [ARC-BUG-16] Resolve the advisor alias through the router before calling.
+            # This leg bypasses the router entirely, so leaving custom_llm_provider=None
+            # made litellm name-infer the provider from the alias: "claude-opus-4-8"
+            # infers "anthropic" and the sub-call executed against Anthropic-direct even
+            # when the alias maps to a Bedrock deployment. Unlike the gate below, this one
+            # reproduces on the ordinary proxy path, because nothing upstream pre-resolves
+            # it. Falls back to the bare alias when no router is configured (SDK use).
+            # The allowlist already excludes api_base/api_key, which are passed explicitly
+            # below, so no defensive pop is needed here.
+            resolved_advisor_model, advisor_routing_params = _resolve_advisor_model_via_router(advisor_model)
             advisor_response: AnthropicMessagesResponse = await _call_messages_handler(
-                model=advisor_model,
+                model=resolved_advisor_model,
                 messages=advisor_messages,
                 tools=None,
                 stream=False,
                 max_tokens=max_tokens,
-                custom_llm_provider=None,  # let litellm resolve from model name
+                custom_llm_provider=None,  # resolved from the model name above
                 metadata={
                     **metadata_base,
                     "advisor_sub_call": True,
@@ -147,6 +175,7 @@ class AdvisorOrchestrationHandler(MessagesInterceptor):
                 },
                 api_key=advisor_api_key,
                 api_base=advisor_api_base,
+                **advisor_routing_params,
             )
 
             advisor_text = _extract_response_text(advisor_response)
@@ -220,6 +249,145 @@ def _resolve_advisor_credentials(advisor_tool: dict) -> tuple[Optional[str], Opt
     if getattr(litellm, "user_url_validation", True):
         validate_url(api_base)
     return api_key, api_base
+
+
+# Deployment params the advisor sub-call may inherit, as an ALLOWLIST.
+#
+# A deny-list was tried first and is the wrong default: a deployment's litellm_params also
+# carry its credentials, so "everything except the reserved names" forwarded
+# aws_access_key_id, aws_secret_access_key, azure_ad_token and vertex_credentials into the
+# call kwargs. They do not reach the spend log — StandardLoggingPayload.model_parameters is
+# itself allowlisted — but any custom logger reads the raw litellm_params dict, and an
+# exception path can stringify them.
+#
+# So enumerate what the sub-call actually needs to land on the right endpoint: region and
+# API version. Credentials are resolved by the provider from the environment or IRSA, the
+# same way the executor leg gets them.
+_ADVISOR_ROUTING_PARAM_ALLOWLIST = frozenset(
+    {
+        "aws_region_name",
+        "vertex_location",
+        "vertex_project",
+        "api_version",
+    }
+)
+
+
+def _resolve_advisor_model_via_router(advisor_model: str) -> tuple[str, dict]:
+    """Resolve a proxy ``model_list`` alias to its real deployment.
+
+    Behind the proxy an alias such as ``"claude-opus-4-8"`` only maps to a concrete
+    deployment (``"bedrock/us.anthropic.claude-opus-4-8"`` plus region and credentials)
+    through the router. The advisor sub-call goes straight to ``anthropic_messages()`` and
+    bypasses the router, so a bare alias either fails ``get_llm_provider()`` outright or —
+    worse, and the reason ARC-BUG-16 exists — name-infers to ``anthropic`` and silently
+    executes against Anthropic-direct instead of the Bedrock deployment the request was
+    routed to.
+
+    Returns ``(model, extra_litellm_params)``, falling back to the original alias and an
+    empty dict when no router is configured or the alias is unknown. That keeps SDK and
+    native-provider behaviour unchanged, where a bare model resolves on its own.
+    """
+    try:
+        from litellm.proxy.proxy_server import llm_router
+    except Exception:
+        return advisor_model, {}
+    if llm_router is None:
+        return advisor_model, {}
+    try:
+        deployment = llm_router.get_available_deployment(model=advisor_model)
+    except Exception as e:
+        # Logged, unlike the earlier version: this fallback sends the sub-call to whatever
+        # the bare alias name-infers, which is the misrouting ARC-BUG-16 exists to prevent.
+        verbose_logger.warning(
+            "advisor sub-call: could not resolve %s through the router, falling back to the "
+            "bare alias — it may execute against the wrong provider (%s: %s)",
+            advisor_model,
+            type(e).__name__,
+            e,
+        )
+        return advisor_model, {}
+    if not deployment:
+        return advisor_model, {}
+    litellm_params = dict(deployment.get("litellm_params") or {})
+    resolved_model = litellm_params.pop("model", None) or advisor_model
+    # Allowlisted routing params only — see _ADVISOR_ROUTING_PARAM_ALLOWLIST for why this
+    # is not a deny-list.
+    extra = {k: v for k, v in litellm_params.items() if k in _ADVISOR_ROUTING_PARAM_ALLOWLIST and v is not None}
+    return resolved_model, extra
+
+
+def resolve_advisor_gate_provider(
+    model: str,
+    custom_llm_provider: Optional[str],
+    tools: Optional[List[Dict]],
+) -> Optional[str]:
+    """Provider to gate the advisor interceptor on (``can_handle``).
+
+    A bare proxy alias like ``"claude-sonnet-4-6"`` name-infers to ``"anthropic"`` via
+    ``get_llm_provider()`` but may map to a non-Anthropic deployment. Gating on the alias
+    treats such a request as advisor-native and skips orchestration for Bedrock-routed
+    aliases, leaking the advisor ``tool_use`` back to the client.
+
+    Resolve the alias to its deployment provider when an advisor tool is present and the
+    provider is either unset or a name-inferred ``anthropic``; otherwise return
+    ``custom_llm_provider`` unchanged.
+
+    Resolution deliberately does NOT go through ``get_available_deployment``. That is the
+    selection API: it load-balances, so on an alias fronting deployments from two providers
+    the gate decision would flip per request (measured: 23 anthropic / 17 bedrock over 40
+    identical calls), and under usage-based routing it performs synchronous Redis reads
+    inside this coroutine. The gate needs the alias's provider, not a load-balanced pick, so
+    it reads the configured deployment list instead — in-memory, order-independent, and free
+    of routing side effects.
+
+    When an alias spans more than one provider and they disagree, resolve to a non-native
+    one so orchestration runs. Skipping it is the failure this fix exists to prevent, and
+    running it against a provider that supports advisor natively is merely redundant.
+
+    The fallback returns the alias-inferred provider, i.e. it degrades back to the behaviour
+    being fixed. That is the safe direction for a routing decision but it is silent, so an
+    unexpected failure logs at warning; a simply-absent router stays at debug.
+    """
+    if custom_llm_provider not in (None, "", "anthropic"):
+        return custom_llm_provider
+    if not tools or not any(isinstance(t, dict) and t.get("type") == ANTHROPIC_ADVISOR_TOOL_TYPE for t in tools):
+        return custom_llm_provider
+    try:
+        from litellm.proxy.proxy_server import llm_router
+    except Exception:
+        return custom_llm_provider
+    if llm_router is None:
+        verbose_logger.debug(
+            "resolve_advisor_gate_provider: no router configured, gating on the alias provider for %s",
+            model,
+        )
+        return custom_llm_provider
+    try:
+        deployments = llm_router.get_model_list(model_name=model) or []
+        providers = set()
+        for deployment in deployments:
+            deployment_model = (deployment.get("litellm_params") or {}).get("model")
+            if not deployment_model:
+                continue
+            _, provider, _, _ = litellm.get_llm_provider(model=deployment_model)
+            if provider:
+                providers.add(provider)
+        if not providers:
+            return custom_llm_provider
+        non_native = sorted(providers - ADVISOR_NATIVE_PROVIDERS)
+        if non_native:
+            return non_native[0]
+        return sorted(providers)[0]
+    except Exception as e:
+        verbose_logger.warning(
+            "resolve_advisor_gate_provider: could not resolve %s, falling back to the alias "
+            "provider — advisor orchestration may be skipped for a non-native deployment (%s: %s)",
+            model,
+            type(e).__name__,
+            e,
+        )
+        return custom_llm_provider
 
 
 def _make_synthetic_advisor_tool() -> Dict:
