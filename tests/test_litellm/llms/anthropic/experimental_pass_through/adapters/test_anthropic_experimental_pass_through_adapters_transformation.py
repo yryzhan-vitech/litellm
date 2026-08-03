@@ -3480,3 +3480,183 @@ async def test_advisor_tool_survives_pre_call_guardrail_translation():
         "gate will decline to orchestrate and the raw tool_use will reach the client"
     )
     assert advisor["model"] == "claude-haiku-4-5"
+
+
+# ---------------------------------------------------------------------------
+# [ARC-BUG-45] follow-ups to ARC-BUG-44, both found by adversarial review
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        pytest.param({"type": "advisor_20260301"}, id="model-missing"),
+        pytest.param({"type": "advisor_20260301", "model": 42}, id="model-not-a-string"),
+        pytest.param({"type": "advisor_20260301", "model": None}, id="model-null"),
+        pytest.param({"type": "advisor_20260301", "model": "x", "defer_loading": "yes"}, id="bad-defer-loading"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_advisor_tool_does_not_fail_the_request(malformed):
+    """A monitor-only guardrail must never turn bad caller input into a 500.
+
+    Keeping the advisor native routes it into ``_map_tool_helper``'s advisor branch, which
+    validates where the generic ``custom`` branch did not. That branch raises, and the raise
+    happens after ``apply_guardrail`` has returned — so neither ``monitor_mode`` nor
+    ``block_failures: false`` is on the path, and a bare ``ValueError`` carries no
+    ``status_code``, surfacing as a 500. Observed live on dev-ai.
+    """
+    from litellm.llms.anthropic.chat.guardrail_translation.handler import (
+        AnthropicMessagesHandler,
+    )
+
+    class _MonitorOnlyGuardrail:
+        guardrail_name = "stub-monitor-only"
+
+        async def apply_guardrail(self, inputs, request_data, input_type, logging_obj=None):
+            return inputs
+
+    # An ORDINARY tool must sit alongside the advisor. Without one,
+    # ``_translate_to_openai`` short-circuits on ``if not regular_tools: return {}`` and
+    # never puts ``tools`` into the guardrail inputs at all, so the vulnerable loop is
+    # never reached and the test passes for the wrong reason. The first version of these
+    # cases used a lone advisor tool and stayed green with the fix reverted.
+    data = {
+        "model": "claude-sonnet-5[1m]",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        "tools": [
+            {
+                "name": "ordinary_tool",
+                "description": "forces the tools block into the guardrail inputs",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+            dict(malformed),
+        ],
+    }
+
+    # Must not raise, and the advisor must survive untouched: it was never converted on
+    # the way in, so it must not be reconstructed on the way out.
+    await AnthropicMessagesHandler().process_input_messages(
+        data=data,
+        guardrail_to_apply=_MonitorOnlyGuardrail(),  # type: ignore[arg-type]
+    )
+    assert malformed in data["tools"], "a native tool must pass through byte-identical"
+    assert any(t.get("name") == "ordinary_tool" for t in data["tools"]), "sibling tool lost"
+
+
+@pytest.mark.asyncio
+async def test_malformed_advisor_tool_does_not_drop_sibling_tools():
+    """The raise also discarded every other tool in the request, valid ones included."""
+    from litellm.llms.anthropic.chat.guardrail_translation.handler import (
+        AnthropicMessagesHandler,
+    )
+
+    class _MonitorOnlyGuardrail:
+        guardrail_name = "stub-monitor-only"
+
+        async def apply_guardrail(self, inputs, request_data, input_type, logging_obj=None):
+            return inputs
+
+    data = {
+        "model": "claude-sonnet-5[1m]",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        "tools": [
+            {
+                "name": "critical_tool",
+                "description": "must survive a malformed sibling",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+            {"type": "advisor_20260301"},  # malformed: no model
+        ],
+    }
+
+    await AnthropicMessagesHandler().process_input_messages(
+        data=data,
+        guardrail_to_apply=_MonitorOnlyGuardrail(),  # type: ignore[arg-type]
+    )
+
+    names = [t.get("name") for t in data["tools"]]
+    assert "critical_tool" in names, "a malformed advisor tool destroyed a valid sibling tool"
+
+
+def test_future_dated_advisor_tool_is_also_kept_native():
+    """Anthropic versions server tools by dated suffix, so match the stem, not the exact value.
+
+    With exact equality, ``advisor_20260302`` fell through to the generic conversion and
+    reproduced ARC-BUG-44 with no test failing.
+    """
+    future = {"type": "advisor_20260302", "model": "claude-opus-5"}
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result, _ = adapter.translate_anthropic_tools_to_openai(tools=[dict(future)])
+
+    assert result == [future]
+
+
+def test_advisor_prefix_does_not_over_match():
+    """The stem must not swallow an unrelated type that merely starts with the same letters."""
+    lookalike = {
+        "name": "advisorish",
+        "type": "advisorish_20260301",
+        "input_schema": {"type": "object", "properties": {}},
+    }
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result, _ = adapter.translate_anthropic_tools_to_openai(tools=[lookalike])
+
+    assert result[0]["type"] == "function", "a lookalike type must still convert normally"
+
+
+@pytest.mark.xfail(
+    reason=(
+        "PRE-EXISTING and NOT fixed by ARC-BUG-45. Measured: the loss is upstream of the "
+        "code this patch touches. `_translate_to_openai` partitions web_search out of "
+        "`tools` into `web_search_options` BEFORE `translate_anthropic_tools_to_openai` is "
+        'called, so the tool never reaches `inputs["tools"]` and the guardrail writeback '
+        "has nothing to put back. Skipping the reverse re-map cannot help. Kept as a "
+        "failing test so the gap is visible and cannot be mistaken for covered."
+    ),
+    strict=True,
+)
+@pytest.mark.asyncio
+async def test_hosted_tools_are_not_dropped_by_the_guardrail_writeback():
+    """A hosted tool must not vanish across the guardrail round-trip.
+
+    Two tools in, one out. Found while fixing the advisor case and initially assumed to
+    share its root cause; measurement showed otherwise, hence the xfail above. Needs its
+    own patch in ``_translate_to_openai``.
+    """
+    from litellm.llms.anthropic.chat.guardrail_translation.handler import (
+        AnthropicMessagesHandler,
+    )
+
+    class _MonitorOnlyGuardrail:
+        guardrail_name = "stub-monitor-only"
+
+        async def apply_guardrail(self, inputs, request_data, input_type, logging_obj=None):
+            return inputs
+
+    web_search = {"type": "web_search_20250305", "name": "web_search"}
+    data = {
+        "model": "claude-sonnet-5[1m]",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        "tools": [
+            {
+                "name": "get_weather",
+                "description": "ordinary function tool",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+            web_search,
+        ],
+    }
+
+    await AnthropicMessagesHandler().process_input_messages(
+        data=data,
+        guardrail_to_apply=_MonitorOnlyGuardrail(),  # type: ignore[arg-type]
+    )
+
+    types_and_names = [(t.get("type"), t.get("name")) for t in data["tools"]]
+    assert ("web_search_20250305", "web_search") in types_and_names, (
+        f"the hosted web_search tool was dropped by the guardrail writeback: {types_and_names}"
+    )
+    assert any(n == "get_weather" for _, n in types_and_names), "the function tool was lost"

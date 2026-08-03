@@ -140,6 +140,12 @@ from .streaming_iterator import AnthropicStreamWrapper
 if TYPE_CHECKING:
     from litellm.types.llms.anthropic import ContentBlockContentBlockDict
 
+# [ARC-BUG-45] Stem of the advisor server-tool type, for prefix matching. Derived from the
+# current dated value rather than hardcoded, so it cannot drift away from it: Anthropic
+# versions server tools by dated suffix, and a future `advisor_20260302` must keep taking
+# the Anthropic-native path. See translate_anthropic_tools_to_openai().
+_ANTHROPIC_ADVISOR_TOOL_PREFIX = ANTHROPIC_ADVISOR_TOOL_TYPE.rsplit("_", 1)[0] + "_"
+
 
 class AnthropicAdapter:
     def __init__(self) -> None:
@@ -848,7 +854,14 @@ class LiteLLMAnthropicMessagesAdapter:
             # correctly declines to orchestrate, and the raw advisor tool_use reaches the
             # client as an uninterpretable block. That is the ARC-BUG-16 symptom which
             # survived a correct gate fix.
-            if tool_type == ANTHROPIC_ADVISOR_TOOL_TYPE or any(
+            # [ARC-BUG-45] Prefix-match, not exact equality. Anthropic versions its server
+            # tools by dated suffix (`web_search_20250305`, `tool_search_tool_20251119`),
+            # which is why the sibling disjunct compares prefixes — `ANTHROPIC_HOSTED_TOOLS`
+            # stores bare stems. Matching the advisor exactly meant a future
+            # `advisor_20260302` would fall straight back through to the generic conversion
+            # and reproduce ARC-BUG-44 with no test failing anywhere. `arcadia/main` has the
+            # same exact comparison; this deliberately diverges from it.
+            if tool_type.startswith(_ANTHROPIC_ADVISOR_TOOL_PREFIX) or any(
                 tool_type.startswith(t.value) for t in ANTHROPIC_HOSTED_TOOLS
             ):
                 # Keep Anthropic-native tools in their original format

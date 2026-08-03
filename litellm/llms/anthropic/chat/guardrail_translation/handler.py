@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 from litellm._logging import verbose_proxy_logger
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig
 from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
+    _ANTHROPIC_ADVISOR_TOOL_PREFIX,
     LiteLLMAnthropicMessagesAdapter,
 )
 from litellm.llms.base_llm.guardrail_translation.base_translation import BaseTranslation
@@ -31,6 +32,7 @@ from litellm.proxy.pass_through_endpoints.llm_provider_handlers.anthropic_passth
     AnthropicPassthroughLoggingHandler,
 )
 from litellm.types.llms.anthropic import (
+    ANTHROPIC_HOSTED_TOOLS,
     AllAnthropicToolsValues,
     AnthropicMessagesRequest,
 )
@@ -55,6 +57,24 @@ if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
     from litellm.types.llms.anthropic_messages.anthropic_response import (
         AnthropicMessagesResponse,
+    )
+
+
+def _is_anthropic_native_tool(tool: Any) -> bool:
+    """[ARC-BUG-45] Did the forward leg keep this tool in Anthropic form?
+
+    Deliberately delegates to ``translate_anthropic_tools_to_openai``'s own predicate rather
+    than restating the type list. The two legs must agree by construction: if a type is
+    kept native on the way in and not recognised as native on the way out, it gets rebuilt
+    from a shape it never had — which is the ARC-BUG-44 defect running in reverse.
+    """
+    if not isinstance(tool, dict):
+        return False
+    tool_type = tool.get("type", "")
+    if not isinstance(tool_type, str):
+        return False
+    return tool_type.startswith(_ANTHROPIC_ADVISOR_TOOL_PREFIX) or any(
+        tool_type.startswith(t.value) for t in ANTHROPIC_HOSTED_TOOLS
     )
 
 
@@ -335,6 +355,32 @@ class AnthropicMessagesHandler(BaseTranslation):
                 anthropic_config = AnthropicConfig()
                 anthropic_tools: List[AllAnthropicToolsValues] = []
                 for tool in guardrailed_tools:
+                    # [ARC-BUG-45] A tool the forward leg kept Anthropic-native is already in
+                    # Anthropic form — do not send it through the OpenAI-to-Anthropic mapping
+                    # a second time. This is the symmetric half of ARC-BUG-44: that fix stopped
+                    # `advisor_20260301` being flattened on the way IN, and this stops the way
+                    # OUT from rebuilding it from a shape it never had.
+                    #
+                    # Re-mapping a native tool is not merely redundant, it is lossy and can
+                    # fail. `_map_tool_helper` reconstructs each tool through a per-type
+                    # allowlist, so any key that type does not enumerate is dropped, and its
+                    # advisor branch *validates* — raising `ValueError` where the generic
+                    # `custom` branch it used to reach did not. That raise is unreachable by
+                    # either of the guardrail's safety valves: `monitor_mode` and
+                    # `block_failures` are both checked inside `apply_guardrail`, which has
+                    # already returned by the time this loop runs. So it propagated out of
+                    # `pre_call_hook` uncaught and, carrying no `status_code`, surfaced as a
+                    # **500** on what was really bad caller input — and took the request's
+                    # other, valid tools with it.
+                    #
+                    # Observed on dev-ai minutes after the ARC-BUG-44 rollout: two requests
+                    # returned 500 "Advisor tool must have a valid model" plus High-severity
+                    # alerts. Skipping the round-trip is preferred over catching the error,
+                    # because catching would leave a valid tool silently stripped of the keys
+                    # this mapping does not carry.
+                    if _is_anthropic_native_tool(tool):
+                        anthropic_tools.append(cast(AllAnthropicToolsValues, tool))
+                        continue
                     converted_tool, mcp_server = anthropic_config._map_tool_helper(tool)
                     if converted_tool is not None:
                         anthropic_tools.append(converted_tool)
