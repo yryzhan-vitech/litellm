@@ -84,6 +84,7 @@ from litellm.llms.anthropic.experimental_pass_through.context_management import 
     PolyfillResult,
 )
 from litellm.types.llms.anthropic import (
+    ANTHROPIC_ADVISOR_TOOL_TYPE,
     ANTHROPIC_HOSTED_TOOLS,
     AllAnthropicToolsValues,
     AnthopicMessagesAssistantMessageParam,
@@ -829,7 +830,27 @@ class LiteLLMAnthropicMessagesAdapter:
         for idx, tool in enumerate(tools):
             # Check if this is an Anthropic-native tool that should be kept as-is
             tool_type = tool.get("type", "")
-            if any(tool_type.startswith(t.value) for t in ANTHROPIC_HOSTED_TOOLS):
+            # [ARC-BUG-44] advisor_20260301 is Anthropic-native but is NOT a member of
+            # ANTHROPIC_HOSTED_TOOLS, so without this disjunct it falls through to the
+            # generic function-tool conversion below and is destroyed in two steps:
+            # `type` is in mapped_tool_params and is dropped, while `model` is not, so it
+            # is folded into function.parameters. The reverse mapping then sees
+            # type="function", takes _map_tool_helper's first branch instead of its
+            # dedicated advisor branch, and rebuilds the tool as type="custom" with
+            # `model` filtered out by the AnthropicInputSchema allowlist.
+            #
+            # This conversion is not hypothetical or advisor-specific plumbing: it runs
+            # inside the pre-call guardrail translation, which is BEFORE the Messages-API
+            # advisor interceptor's gate. A guardrail in monitor_mode does not protect
+            # against it — monitor_mode only forces action=NONE, and the tools list it
+            # returns unchanged is already the flattened OpenAI one, which the caller then
+            # writes back to data["tools"] unconditionally. So the gate sees type="custom",
+            # correctly declines to orchestrate, and the raw advisor tool_use reaches the
+            # client as an uninterpretable block. That is the ARC-BUG-16 symptom which
+            # survived a correct gate fix.
+            if tool_type == ANTHROPIC_ADVISOR_TOOL_TYPE or any(
+                tool_type.startswith(t.value) for t in ANTHROPIC_HOSTED_TOOLS
+            ):
                 # Keep Anthropic-native tools in their original format
                 new_tools.append(tool)  # type: ignore[arg-type]
                 continue

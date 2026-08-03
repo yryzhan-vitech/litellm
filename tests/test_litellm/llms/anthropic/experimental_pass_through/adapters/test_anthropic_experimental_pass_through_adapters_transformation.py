@@ -3363,3 +3363,120 @@ def test_translate_anthropic_tools_to_openai_does_not_mutate_input_schema():
     assert input_schema == {"type": "object", "properties": {"action": {"type": "string"}}}
     assert "display_width_px" not in input_schema
     assert tool["input_schema"] is input_schema
+
+
+# ---------------------------------------------------------------------------
+# [ARC-BUG-44] advisor_20260301 must survive the guardrail OpenAI round-trip
+# ---------------------------------------------------------------------------
+
+
+def _advisor_tool() -> dict:
+    return {"type": "advisor_20260301", "model": "claude-haiku-4-5", "max_uses": 3}
+
+
+def test_advisor_tool_is_kept_native_in_openai_translation():
+    """``advisor_20260301`` is Anthropic-native but is not in ANTHROPIC_HOSTED_TOOLS.
+
+    The pre-call guardrail translation converts request tools to OpenAI form to scan
+    them. If the advisor tool is flattened there it reaches the Messages-API gate as a
+    generic tool and orchestration is skipped, so the raw advisor ``tool_use`` leaks to
+    the client. Assert the payload, not a call count.
+    """
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result, tool_name_mapping = adapter.translate_anthropic_tools_to_openai(tools=[_advisor_tool()])
+
+    assert len(result) == 1
+    assert result[0] == _advisor_tool(), "advisor tool must pass through byte-identical"
+    assert tool_name_mapping == {}
+
+
+def test_advisor_tool_survives_the_full_round_trip():
+    """Forward then reverse: ``type`` and ``model`` must both survive.
+
+    ``model`` is the field that matters — it names the advisor deployment, and it is the
+    one the generic path silently drops.
+    """
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    openai_tools, _ = adapter.translate_anthropic_tools_to_openai(tools=[_advisor_tool()])
+    restored, _mcp_server = AnthropicConfig()._map_tool_helper(openai_tools[0])
+
+    assert restored is not None
+    assert restored["type"] == "advisor_20260301"
+    assert restored["model"] == "claude-haiku-4-5"
+
+
+def test_non_advisor_tools_are_still_converted():
+    """The advisor carve-out must not stop ordinary tools converting to OpenAI form."""
+    tools = [
+        {
+            "name": "get_weather",
+            "description": "Look up the weather",
+            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+        },
+        _advisor_tool(),
+    ]
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result, _ = adapter.translate_anthropic_tools_to_openai(tools=tools)
+
+    assert len(result) == 2
+    assert result[0]["type"] == "function"
+    assert result[0]["function"]["name"] == "get_weather"
+    assert result[1] == _advisor_tool()
+
+
+def test_hosted_tools_are_still_kept_native():
+    """The pre-existing ANTHROPIC_HOSTED_TOOLS behaviour is unchanged."""
+    web_search = {"type": "web_search_20250305", "name": "web_search"}
+
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    result, _ = adapter.translate_anthropic_tools_to_openai(tools=[web_search])
+
+    assert result == [web_search]
+
+
+@pytest.mark.asyncio
+async def test_advisor_tool_survives_pre_call_guardrail_translation():
+    """The real production path, in one test: a monitor-mode guardrail must not strip advisor.
+
+    This is the shape that broke. ``UnifiedLLMGuardrails`` routes a ``/v1/messages``
+    request through ``AnthropicMessagesHandler.process_input_messages``, which converts
+    ``data["tools"]`` to OpenAI form, hands them to the guardrail, converts back, and
+    writes the result to ``data["tools"]`` UNCONDITIONALLY.
+
+    A guardrail in monitor mode returns ``inputs`` untouched — but ``inputs["tools"]`` is
+    already the converted list, so the writeback still persists whatever the conversion
+    produced. That is why the fix belongs on the forward leg and not behind a
+    "did the guardrail change anything?" check.
+    """
+    from litellm.llms.anthropic.chat.guardrail_translation.handler import (
+        AnthropicMessagesHandler,
+    )
+
+    class _MonitorOnlyGuardrail:
+        """Stands in for Noma in monitor_mode: sees everything, changes nothing."""
+
+        guardrail_name = "stub-monitor-only"
+
+        async def apply_guardrail(self, inputs, request_data, input_type, logging_obj=None):
+            return inputs
+
+    data = {
+        "model": "claude-sonnet-5[1m]",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        "tools": [_advisor_tool()],
+    }
+
+    await AnthropicMessagesHandler().process_input_messages(
+        data=data,
+        guardrail_to_apply=_MonitorOnlyGuardrail(),  # type: ignore[arg-type]
+    )
+
+    advisor = next((t for t in data["tools"] if t.get("type") == "advisor_20260301"), None)
+    assert advisor is not None, (
+        "the advisor tool was destroyed by the guardrail round-trip — the Messages-API "
+        "gate will decline to orchestrate and the raw tool_use will reach the client"
+    )
+    assert advisor["model"] == "claude-haiku-4-5"
