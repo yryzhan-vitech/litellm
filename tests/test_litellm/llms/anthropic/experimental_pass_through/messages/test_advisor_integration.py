@@ -364,3 +364,111 @@ async def test_pre_request_hook_override_does_not_collide_with_explicit_kwargs()
     assert captured["thinking"] == {"type": "enabled", "budget_tokens": 2048}
     assert captured["system"] == "Hook overrode the system prompt."
     assert captured["temperature"] == 0.1
+
+
+# ---------------------------------------------------------------------------
+# [ARC-BUG-46] malformed advisor input must be a 400, not a 500
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_tool, expect_in_message",
+    [
+        pytest.param({"type": "advisor_20260301", "name": "advisor"}, "model", id="model-missing"),
+        pytest.param({"type": "advisor_20260301", "name": "advisor", "model": None}, "model", id="model-null"),
+        pytest.param({"type": "advisor_20260301", "name": "advisor", "model": ""}, "model", id="model-empty"),
+        pytest.param({"type": "advisor_20260301", "name": "advisor", "model": "   "}, "model", id="model-blank"),
+        pytest.param({"type": "advisor_20260301", "name": "advisor", "model": 42}, "model", id="model-not-a-string"),
+        pytest.param(
+            {"type": "advisor_20260301", "name": "advisor", "model": "claude-opus-4-6", "max_uses": "abc"},
+            "max_uses",
+            id="max-uses-not-an-int",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_advisor_tool_is_a_400_not_a_500(bad_tool, expect_in_message):
+    """A malformed advisor tool is bad caller input, so it must not page as a server fault.
+
+    A bare ``ValueError`` carries no ``status_code``, and the proxy's
+    ``getattr(e, "status_code", 500)`` therefore reported a malformed request body as a
+    500 with a High-severity alert. Measured live on dev-ai before this fix.
+    """
+    from litellm.exceptions import BadRequestError
+    from litellm.llms.anthropic.experimental_pass_through.messages.interceptors.advisor import (
+        AdvisorOrchestrationHandler,
+    )
+
+    with pytest.raises(BadRequestError) as exc_info:
+        await AdvisorOrchestrationHandler().handle(
+            model="claude-sonnet-5[1m]",
+            messages=list(MESSAGES),
+            tools=[bad_tool],
+            stream=False,
+            max_tokens=64,
+            custom_llm_provider="bedrock",
+        )
+
+    assert exc_info.value.status_code == 400, "malformed caller input must not surface as a 5xx"
+    assert expect_in_message in str(exc_info.value), "the message must name the offending field"
+
+
+@pytest.mark.asyncio
+async def test_a_valid_advisor_tool_still_reaches_orchestration():
+    """Guard against the 400 path swallowing well-formed requests."""
+    from litellm.llms.anthropic.experimental_pass_through.messages.interceptors.advisor import (
+        AdvisorOrchestrationHandler,
+    )
+
+    reached = {}
+
+    async def _fake_call(**kwargs):
+        reached["model"] = kwargs.get("model")
+        return {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-4-6",
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+
+    with patch(
+        "litellm.llms.anthropic.experimental_pass_through.messages.interceptors.advisor._call_messages_handler",
+        new=_fake_call,
+    ):
+        await AdvisorOrchestrationHandler().handle(
+            model="claude-sonnet-5[1m]",
+            messages=list(MESSAGES),
+            tools=[dict(ADVISOR_TOOL)],
+            stream=False,
+            max_tokens=64,
+            custom_llm_provider="bedrock",
+        )
+
+    assert reached, "a well-formed advisor tool must still reach the orchestration loop"
+
+
+@pytest.mark.asyncio
+async def test_missing_advisor_tool_stays_a_500():
+    """An internal contract violation is NOT caller input and must not be downgraded.
+
+    ``can_handle()`` has already established the tool is present, so its absence here means
+    the caller and the gate disagree — a server-side bug, honestly reported as one.
+    """
+    from litellm.llms.anthropic.experimental_pass_through.messages.interceptors.advisor import (
+        AdvisorOrchestrationHandler,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        await AdvisorOrchestrationHandler().handle(
+            model="claude-sonnet-5[1m]",
+            messages=list(MESSAGES),
+            tools=[{"name": "not_an_advisor", "input_schema": {"type": "object", "properties": {}}}],
+            stream=False,
+            max_tokens=64,
+            custom_llm_provider="bedrock",
+        )
+
+    assert not hasattr(exc_info.value, "status_code") or exc_info.value.status_code != 400

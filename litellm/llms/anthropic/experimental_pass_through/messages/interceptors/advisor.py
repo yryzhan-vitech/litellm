@@ -20,6 +20,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 import litellm
 import litellm.constants as _c
 from litellm._logging import verbose_logger
+from litellm.exceptions import BadRequestError
 from litellm.litellm_core_utils.url_utils import validate_url
 from litellm.llms.anthropic.common_utils import strip_advisor_blocks_from_messages
 from litellm.types.llms.anthropic_messages.anthropic_response import (
@@ -73,12 +74,43 @@ class AdvisorOrchestrationHandler(MessagesInterceptor):
             None,
         )
         if advisor_tool is None:
+            # Not caller input: can_handle() already found this tool, so its absence here is
+            # an internal contract violation and a 500 is the honest answer.
             raise ValueError(f"handle() called but no {ANTHROPIC_ADVISOR_TOOL_TYPE} tool found in tools list")
-        advisor_model: str = advisor_tool.get("model") or ""
-        if not advisor_model:
-            raise ValueError("advisor tool definition must include a 'model' field specifying the advisor model")
+        # [ARC-BUG-46] Everything below validates CALLER input, so it must be a 400.
+        #
+        # A bare ValueError carries no `status_code`, so the proxy's
+        # `getattr(e, "status_code", 500)` reported a malformed request body as a server
+        # fault: HTTP 500 plus a High-severity `llm_exceptions` alert, on every such
+        # request. Measured on dev-ai: a request whose advisor tool omits `model` returned
+        # 500 and paged, while the same request with `model` present returned 200.
+        #
+        # This surfaced only once ARC-BUG-44 and ARC-BUG-45 let the advisor tool reach this
+        # code at all. Before them it was flattened into a generic tool upstream of the gate
+        # and orchestration was skipped, so these checks never ran. Fixing the earlier two
+        # is what made this reachable — not a new defect they introduced.
+        advisor_model = advisor_tool.get("model")
+        if not isinstance(advisor_model, str) or not advisor_model.strip():
+            raise BadRequestError(
+                message=(
+                    "advisor tool definition must include a non-empty string 'model' field naming the "
+                    "advisor model. It is required by the Anthropic advisor tool spec and has no default."
+                ),
+                model=model,
+                llm_provider=custom_llm_provider or "anthropic",
+            )
         _raw_max_uses = advisor_tool.get("max_uses")
-        max_uses: int = ADVISOR_MAX_USES if _raw_max_uses is None else int(_raw_max_uses)
+        try:
+            max_uses: int = ADVISOR_MAX_USES if _raw_max_uses is None else int(_raw_max_uses)
+        except (TypeError, ValueError):
+            # `int("abc")` and `int(None)` both raise, and both are caller input.
+            raise BadRequestError(
+                message=(
+                    f"advisor tool 'max_uses' must be an integer, got {type(_raw_max_uses).__name__}: {_raw_max_uses!r}"
+                ),
+                model=model,
+                llm_provider=custom_llm_provider or "anthropic",
+            )
         advisor_api_key, advisor_api_base = _resolve_advisor_credentials(advisor_tool)
 
         # Build the synthetic tool definition the provider will receive.
