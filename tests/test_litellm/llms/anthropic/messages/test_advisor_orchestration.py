@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from litellm.exceptions import BadRequestError
+
 ADVISOR_TOOL = {
     "type": "advisor_20260301",
     "name": "advisor",
@@ -786,7 +788,9 @@ def test_resolve_advisor_credentials_rejects_api_base_without_api_key():
         "litellm.llms.anthropic.experimental_pass_through.messages.interceptors.advisor._allow_client_side_advisor_credentials",
         return_value=True,
     ):
-        with pytest.raises(ValueError, match="api_base"):
+        # [review finding] Caller input -> 400, not a bare ValueError (which the proxy
+        # reports as a 500 and pages on). See ARC-BUG-46, which fixed the sibling paths.
+        with pytest.raises(BadRequestError, match="api_base"):
             _resolve_advisor_credentials(tool)
 
 
@@ -882,7 +886,7 @@ def test_resolve_advisor_credentials_rejects_non_https_api_base():
         "litellm.llms.anthropic.experimental_pass_through.messages.interceptors.advisor._allow_client_side_advisor_credentials",
         return_value=True,
     ):
-        with pytest.raises(ValueError, match="https"):
+        with pytest.raises(BadRequestError, match="https"):
             _resolve_advisor_credentials(tool)
 
 
@@ -901,7 +905,7 @@ def test_resolve_advisor_credentials_rejects_api_base_when_ssl_verify_disabled()
         ),
         patch.object(litellm, "ssl_verify", False),
     ):
-        with pytest.raises(ValueError, match="ssl_verify"):
+        with pytest.raises(BadRequestError, match="ssl_verify"):
             _resolve_advisor_credentials(tool)
 
 

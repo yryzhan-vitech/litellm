@@ -26,7 +26,7 @@ from litellm.llms.anthropic.common_utils import strip_advisor_blocks_from_messag
 from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,
 )
-from litellm.types.llms.anthropic import ANTHROPIC_ADVISOR_TOOL_TYPE
+from litellm.types.llms.anthropic import ANTHROPIC_ADVISOR_TOOL_TYPE, is_advisor_tool
 
 ADVISOR_MAX_USES: int = _c.ADVISOR_MAX_USES
 ADVISOR_NATIVE_PROVIDERS: frozenset = _c.ADVISOR_NATIVE_PROVIDERS
@@ -49,7 +49,7 @@ class AdvisorOrchestrationHandler(MessagesInterceptor):
     ) -> bool:
         if not tools:
             return False
-        has_advisor = any(t.get("type") == ANTHROPIC_ADVISOR_TOOL_TYPE for t in tools)
+        has_advisor = any(is_advisor_tool(t) for t in tools)
         is_non_native = custom_llm_provider not in ADVISOR_NATIVE_PROVIDERS
         return has_advisor and is_non_native
 
@@ -70,7 +70,7 @@ class AdvisorOrchestrationHandler(MessagesInterceptor):
 
         # Extract advisor tool config.
         advisor_tool = next(
-            (t for t in (tools or []) if t.get("type") == ANTHROPIC_ADVISOR_TOOL_TYPE),
+            (t for t in (tools or []) if is_advisor_tool(t)),
             None,
         )
         if advisor_tool is None:
@@ -111,15 +111,15 @@ class AdvisorOrchestrationHandler(MessagesInterceptor):
                 model=model,
                 llm_provider=custom_llm_provider or "anthropic",
             )
-        advisor_api_key, advisor_api_base = _resolve_advisor_credentials(advisor_tool)
+        advisor_api_key, advisor_api_base = _resolve_advisor_credentials(
+            advisor_tool, model=model, custom_llm_provider=custom_llm_provider
+        )
 
         # Build the synthetic tool definition the provider will receive.
         synthetic_advisor_tool = _make_synthetic_advisor_tool()
 
         # Executor tools = all original tools with advisor replaced by the synthetic one.
-        executor_tools: List[Dict] = [
-            (synthetic_advisor_tool if t.get("type") == ANTHROPIC_ADVISOR_TOOL_TYPE else t) for t in (tools or [])
-        ]
+        executor_tools: List[Dict] = [(synthetic_advisor_tool if is_advisor_tool(t) else t) for t in (tools or [])]
 
         # Strip prior advisor blocks from history, preserving advice text as context.
         current_messages: List[Dict] = strip_advisor_blocks_from_messages(
@@ -240,8 +240,30 @@ def _allow_client_side_advisor_credentials() -> bool:
     return general_settings.get("allow_client_side_credentials") is True
 
 
-def _resolve_advisor_credentials(advisor_tool: dict) -> tuple[Optional[str], Optional[str]]:
+def _resolve_advisor_credentials(
+    advisor_tool: dict,
+    model: Optional[str] = None,
+    custom_llm_provider: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
     """Resolve the (api_key, api_base) override for the advisor sub-call.
+
+    [ARC-BUG-46 follow-up] Every rejection below is CALLER input — the advisor tool's
+    own ``api_base``/``api_key`` fields — so each is a 400. They were bare
+    ``ValueError``s, which carry no ``status_code``, so the proxy's
+    ``getattr(e, "status_code", 500)`` reported a malformed request body as a server
+    fault and raised a High-severity ``llm_exceptions`` alert on every such request.
+    That is the same defect ARC-BUG-46 fixed for ``model`` and ``max_uses``; these three
+    paths were missed because they live one call away, in this helper.
+
+    They are currently unreachable on the deployed configuration —
+    ``allow_client_side_credentials`` is unset, so the guard above returns first — which
+    is why the ARC-BUG-46 validation found five malformed shapes returning 400 and no
+    sixth. Turning that setting on would have re-opened the paging defect silently.
+
+    The TLS-verification arm is a proxy misconfiguration rather than bad input, but the
+    caller can always resolve it by not supplying ``api_base``, and failing it as a 400
+    keeps a caller-triggered condition off the on-call pager. ``model`` and
+    ``custom_llm_provider`` are optional so SDK callers of this helper keep working.
 
     A caller-supplied ``api_base`` is only honored alongside a caller-supplied
     ``api_key``: without one, ``AnthropicModelInfo.get_auth_header()`` falls
@@ -264,19 +286,31 @@ def _resolve_advisor_credentials(advisor_tool: dict) -> tuple[Optional[str], Opt
     if api_base is None:
         return api_key, None
     if not api_key:
-        raise ValueError(
-            "advisor tool definition sets 'api_base' without 'api_key'. A "
-            "caller-supplied api_base is only honored alongside a "
-            "caller-supplied api_key, so the proxy's own credentials are "
-            "never sent to a caller-chosen destination."
+        raise BadRequestError(
+            message=(
+                "advisor tool definition sets 'api_base' without 'api_key'. A "
+                "caller-supplied api_base is only honored alongside a "
+                "caller-supplied api_key, so the proxy's own credentials are "
+                "never sent to a caller-chosen destination."
+            ),
+            model=model or "",
+            llm_provider=custom_llm_provider or "anthropic",
         )
     if not api_base.startswith("https://"):
-        raise ValueError(f"advisor tool definition sets 'api_base'={api_base!r}, which must use the https scheme.")
+        raise BadRequestError(
+            message=f"advisor tool definition sets 'api_base'={api_base!r}, which must use the https scheme.",
+            model=model or "",
+            llm_provider=custom_llm_provider or "anthropic",
+        )
     if getattr(litellm, "ssl_verify", True) is False:
-        raise ValueError(
-            "advisor tool definition sets 'api_base' but the proxy has TLS verification "
-            "disabled (litellm.ssl_verify=False), so a caller-supplied api_base can't be "
-            "safely validated against DNS rebinding."
+        raise BadRequestError(
+            message=(
+                "advisor tool definition sets 'api_base' but the proxy has TLS verification "
+                "disabled (litellm.ssl_verify=False), so a caller-supplied api_base can't be "
+                "safely validated against DNS rebinding."
+            ),
+            model=model or "",
+            llm_provider=custom_llm_provider or "anthropic",
         )
     if getattr(litellm, "user_url_validation", True):
         validate_url(api_base)
@@ -383,7 +417,7 @@ def resolve_advisor_gate_provider(
     """
     if custom_llm_provider not in (None, "", "anthropic"):
         return custom_llm_provider
-    if not tools or not any(isinstance(t, dict) and t.get("type") == ANTHROPIC_ADVISOR_TOOL_TYPE for t in tools):
+    if not tools or not any(is_advisor_tool(t) for t in tools):
         return custom_llm_provider
     try:
         from litellm.proxy.proxy_server import llm_router

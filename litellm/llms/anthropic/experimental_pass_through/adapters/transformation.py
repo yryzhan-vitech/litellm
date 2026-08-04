@@ -84,7 +84,7 @@ from litellm.llms.anthropic.experimental_pass_through.context_management import 
     PolyfillResult,
 )
 from litellm.types.llms.anthropic import (
-    ANTHROPIC_ADVISOR_TOOL_TYPE,
+    ANTHROPIC_ADVISOR_TOOL_PREFIX,
     ANTHROPIC_HOSTED_TOOLS,
     AllAnthropicToolsValues,
     AnthopicMessagesAssistantMessageParam,
@@ -140,11 +140,14 @@ from .streaming_iterator import AnthropicStreamWrapper
 if TYPE_CHECKING:
     from litellm.types.llms.anthropic import ContentBlockContentBlockDict
 
-# [ARC-BUG-45] Stem of the advisor server-tool type, for prefix matching. Derived from the
-# current dated value rather than hardcoded, so it cannot drift away from it: Anthropic
+# [ARC-BUG-45] Stem of the advisor server-tool type, for prefix matching. Anthropic
 # versions server tools by dated suffix, and a future `advisor_20260302` must keep taking
 # the Anthropic-native path. See translate_anthropic_tools_to_openai().
-_ANTHROPIC_ADVISOR_TOOL_PREFIX = ANTHROPIC_ADVISOR_TOOL_TYPE.rsplit("_", 1)[0] + "_"
+#
+# Now re-exported from litellm.types.llms.anthropic rather than derived here, so the
+# interceptor's gate matches on exactly the same stem this leg does. Kept under the
+# private name because guardrail_translation/handler.py imports it from this module.
+_ANTHROPIC_ADVISOR_TOOL_PREFIX = ANTHROPIC_ADVISOR_TOOL_PREFIX
 
 
 class AnthropicAdapter:

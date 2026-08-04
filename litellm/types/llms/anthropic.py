@@ -129,6 +129,31 @@ class AnthropicToolSearchToolBM25(TypedDict, total=False):
 
 ANTHROPIC_ADVISOR_TOOL_TYPE: Literal["advisor_20260301"] = "advisor_20260301"
 
+# Stem of the advisor server-tool type, for prefix matching. Derived from the current
+# dated value rather than hardcoded, so it cannot drift away from it.
+#
+# Anthropic versions server tools by dated suffix. ARC-BUG-45 established that the
+# adapter must keep a future ``advisor_20260302`` on the Anthropic-native path, but it
+# introduced the prefix privately in adapters/transformation.py, so the interceptor's
+# gate, ``can_handle`` and ``handle`` kept matching the dated value exactly. That split
+# is the ARC-BUG-44 failure waiting on a calendar: the adapter would keep the next
+# version native while the gate declined to orchestrate it, and the raw ``tool_use``
+# would reach the client again. One predicate, used by both, is what stops that.
+ANTHROPIC_ADVISOR_TOOL_PREFIX: str = ANTHROPIC_ADVISOR_TOOL_TYPE.rsplit("_", 1)[0] + "_"
+
+
+def is_advisor_tool(tool: Any) -> bool:
+    """True when ``tool`` is an advisor server-tool of any dated version.
+
+    Accepts ``Any`` because callers hold loosely-typed request payloads: a ``tools``
+    list is caller input and may contain non-dicts, and a non-string ``type`` must not
+    raise here.
+    """
+    if not isinstance(tool, dict):
+        return False
+    tool_type = tool.get("type")
+    return isinstance(tool_type, str) and tool_type.startswith(ANTHROPIC_ADVISOR_TOOL_PREFIX)
+
 
 class AnthropicAdvisorTool(TypedDict, total=False):
     """Advisor tool — pairs a fast executor model with a high-intelligence advisor model."""
