@@ -65,6 +65,23 @@ def _resolve_proxy_model_alias_to_litellm_model(model: str) -> str:
     return ""
 
 
+def _to_anthropic_native_model(model: str) -> str:
+    """Return `model` as an Anthropic-native id, or "" if it is not one.
+
+    Anthropic's /v1/messages rejects any provider-prefixed value, so the only safe rewrite is one
+    that lands on a bare id. `anthropic/x` -> `x`; anything else carrying a "/" (`bedrock/...`,
+    `vertex_ai/...`, `openai/...`) is NOT convertible and returns "" so the caller leaves the value
+    alone. Bedrock ids are deliberately not translated: `us.anthropic.claude-sonnet-5-v1:0` carries a
+    region prefix and a version suffix that no Anthropic id has, and reconstructing one by string
+    surgery is the guessing that produced the ARC-BUG-44/45 family.
+    """
+    if not model:
+        return ""
+    if model.startswith("anthropic/"):
+        return model.split("/", 1)[1]
+    return "" if "/" in model else model
+
+
 def _normalize_anthropic_advisor_tool_models(tools: List[Dict]) -> List[Dict]:
     """
     Normalize advisor tool model names for Anthropic native /v1/messages calls.
@@ -86,11 +103,36 @@ def _normalize_anthropic_advisor_tool_models(tools: List[Dict]) -> List[Dict]:
         updated_tool = dict(tool)
         advisor_model = updated_tool.get("model")
         if isinstance(advisor_model, str) and advisor_model.strip():
-            resolved = _resolve_proxy_model_alias_to_litellm_model(advisor_model.strip())
-            canonical_model = resolved or advisor_model.strip()
-            if canonical_model.startswith("anthropic/"):
-                canonical_model = canonical_model.split("/", 1)[1]
-            updated_tool["model"] = canonical_model
+            requested = advisor_model.strip()
+            resolved = _resolve_proxy_model_alias_to_litellm_model(requested)
+            canonical_model = _to_anthropic_native_model(resolved) or _to_anthropic_native_model(requested)
+            # 🔴 Only overwrite when a NATIVE name was actually recovered. The prod version wrote
+            # `resolved or requested` unconditionally and stripped only the `anthropic/` prefix,
+            # which regressed every bedrock-backed group. Measured against a prd-ai-shaped
+            # model_list (20 of 36 groups are `bedrock/`):
+            #
+            #   IN                          prod hunk                                    verdict
+            #   claude-opus-4-6      -> bedrock/us.anthropic.claude-opus-4-6-v1:0    was ok -> 400
+            #   claude-sonnet-5      -> bedrock/us.anthropic.claude-sonnet-5-v1:0    was ok -> 400
+            #   claude-haiku-4-5     -> bedrock/us.anthropic.claude-haiku-4-5-v1:0   was ok -> 400
+            #   anthropic/claude-... -> claude-opus-4-6                              was 400 -> ok
+            #
+            # Three regressions for one fix, on a path any CLIENT opens by putting an advisor tool
+            # in the body — there is no config gate and no kill switch. It survived 215 tests and
+            # two reviews because every fixture in TestAdvisorModelNormalisation is anthropic-backed.
+            #
+            # A bare alias like `claude-sonnet-5` is BOTH our model_name and a valid Anthropic model
+            # id, so leaving it untouched is the correct outcome: pass it through and let Anthropic
+            # judge it, rather than rewriting it into a name Anthropic has never heard of.
+            if canonical_model:
+                updated_tool["model"] = canonical_model
+            else:
+                verbose_logger.debug(
+                    "Advisor tool model %r resolves to %r, which is not an Anthropic-native model id; "
+                    "forwarding the caller's value unchanged.",
+                    requested,
+                    resolved or requested,
+                )
         normalized_tools.append(updated_tool)
     return normalized_tools
 

@@ -379,7 +379,12 @@ class AnthropicMessagesHandler(BaseTranslation):
                     # because catching would leave a valid tool silently stripped of the keys
                     # this mapping does not carry.
                     if _is_anthropic_native_tool(tool):
-                        anthropic_tools.append(cast(AllAnthropicToolsValues, tool))
+                        # No cast: the loop variable is already Any (the guardrail returns untyped
+                        # JSON), so appending is accepted without one. The original cast was pure
+                        # noise that cost a LIT006 budget slot — and the gate counts casts rather
+                        # than reading a `# cast-ok:` reason, despite its own error text offering one.
+                        # The runtime check on the line above is what actually establishes the type.
+                        anthropic_tools.append(tool)
                         continue
                     converted_tool, mcp_server = anthropic_config._map_tool_helper(tool)
                     if converted_tool is not None:

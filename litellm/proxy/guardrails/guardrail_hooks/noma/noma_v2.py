@@ -515,6 +515,17 @@ class NomaV2Guardrail(CustomGuardrail):
         logging_obj: Optional["LiteLLMLoggingObj"] = None,
     ) -> GenericGuardrailAPIInputs:
         start_time = datetime.now()
+        # [ARC-BUG-47] Clear the per-attempt classifier BEFORE anything can raise.
+        #
+        # 🔴 A review found this reachable with the real hook sequence, not a hypothetical one:
+        # pre_call (input_type=request) and post_call (input_type=response) scan inside ONE request
+        # context, and the reset used to live only inside _call_noma_scan's loop. So anything
+        # raising earlier in this method — _build_scan_payload, _get_authorization_header,
+        # _sanitize_payload_for_transport — sent the classifier reading the PREVIOUS leg's value.
+        # Measured: pre_call genuinely expired at 9.8s, then post_call failed in 0.000s and was
+        # audited timed_out=True. That is ARC-BUG-43's inversion in the opposite direction, and
+        # block_failures=False swallows it, so it is invisible.
+        _LAST_SCAN_ATTEMPT_ELAPSED.set(None)
         guardrail_status: GuardrailStatus = "success"
         guardrail_json_response: Any = {}
         dynamic_params = self.get_guardrail_dynamic_request_body_params(request_data)
