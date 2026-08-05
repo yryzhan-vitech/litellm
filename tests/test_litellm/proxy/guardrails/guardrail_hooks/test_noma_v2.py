@@ -11,6 +11,7 @@ import litellm
 
 from litellm.constants import HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.guardrails.guardrail_hooks.noma import noma_v2 as nv2
 from litellm.proxy.guardrails.guardrail_hooks.noma import (
     NomaV2Guardrail,
     initialize_guardrail,
@@ -1455,3 +1456,353 @@ class TestNomaV2ScanTimeout:
         # ...but the audit record, which goes to the PHI-bearing store, keeps the detail.
         entry = request_data["metadata"]["standard_logging_guardrail_information"][0]
         assert secret in entry["guardrail_response"]["detail"]
+
+
+class TestNomaV2ConnectionFailureRetry:
+    """[ARC-BUG-47] A broken pooled connection reaches us disguised as a timeout.
+
+    aiohttp raises SocketTimeoutError when a connection breaks WHILE READING, and the
+    transport maps that to httpx.ReadTimeout. The shape that identifies it is elapsed
+    time far below the budget: measured on prd-ai at 2-93ms against 10s, on ~24% of scans.
+
+    These tests pin the discriminator (elapsed vs budget), not the exception type — the
+    type is identical for a real expiry, which is exactly why the bug was invisible.
+    """
+
+    @staticmethod
+    def _ok_response():
+        response = MagicMock()
+        response.status_code = 200
+        response.text = '{"action":"NONE"}'
+        response.json.return_value = {"action": "NONE"}
+        response.raise_for_status = MagicMock()
+        return response
+
+    @pytest.mark.asyncio
+    async def test_fast_timeout_is_retried_once_and_succeeds(self, noma_v2_guardrail):
+        """The bug's exact shape: instant ReadTimeout, then a healthy Noma on retry."""
+        post = AsyncMock(side_effect=[httpx.ReadTimeout("Timeout on reading data from socket"), self._ok_response()])
+        with patch.object(noma_v2_guardrail.async_handler, "post", post):
+            result = await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+
+        assert result == {"action": "NONE"}
+        assert post.await_count == 2, "a fast timeout must be retried exactly once"
+
+    @pytest.mark.asyncio
+    async def test_retry_is_not_a_loop(self, noma_v2_guardrail):
+        """Two fast failures must raise, not retry forever.
+
+        If a freshly-established connection also dies this fast, connection reuse is not
+        the problem and further attempts only spend the caller's budget.
+        """
+        post = AsyncMock(side_effect=httpx.ReadTimeout("Timeout on reading data from socket"))
+        with patch.object(noma_v2_guardrail.async_handler, "post", post):
+            with pytest.raises(httpx.ReadTimeout):
+                await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+
+        assert post.await_count == 2, "one retry, then give up"
+
+    @pytest.mark.asyncio
+    async def test_real_deadline_expiry_is_not_retried(self, noma_v2_guardrail):
+        """The critical negative case, and the reason the threshold exists.
+
+        Same exception type as the bug. Only the elapsed time differs. A scan that
+        genuinely burned its budget must NOT be retried — that would double the latency
+        ceiling ARC-BUG-43 exists to guarantee, on a Noma that is merely slow.
+        """
+        # scan_timeout must sit ABOVE the connect budget, or the remaining-budget guard
+        # declines the retry first and this test passes for the wrong reason. Measured that
+        # exact false pass while building it: at scan_timeout=2.0 the budget guard fired, so
+        # widening the threshold to 1.0 left all tests green. Only the threshold can decline
+        # the retry at these values.
+        noma_v2_guardrail.scan_timeout = HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS * 4
+
+        # Fails at 25% of the budget: far past the 5% connection-failure threshold, and the
+        # remaining 75% is comfortably more than one more handshake.
+        async def expire_at_a_quarter_of_the_budget(*args, **kwargs):
+            await asyncio.sleep(HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS)
+            raise httpx.ReadTimeout("real expiry")
+
+        post = AsyncMock(side_effect=expire_at_a_quarter_of_the_budget)
+        with patch.object(noma_v2_guardrail.async_handler, "post", post):
+            with pytest.raises((httpx.ReadTimeout, asyncio.TimeoutError)):
+                await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+
+        assert post.await_count == 1, "a genuine expiry must not be retried"
+
+    @pytest.mark.asyncio
+    async def test_non_timeout_errors_are_never_retried(self, noma_v2_guardrail):
+        """A 500 or a bad payload is not a connection problem. Retrying hides it."""
+        post = AsyncMock(side_effect=ValueError("malformed"))
+        with patch.object(noma_v2_guardrail.async_handler, "post", post):
+            with pytest.raises(ValueError):
+                await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+
+        assert post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_all_three_timeout_types_are_covered(self, noma_v2_guardrail):
+        """The bug arrives as any of the three hierarchies _TIMEOUT_EXCEPTIONS lists.
+
+        openai.APITimeoutError is the one that actually reached us in production — the
+        shared handler converts httpx timeouts before we see them.
+        """
+        for exc in (
+            httpx.ReadTimeout("socket"),
+            asyncio.TimeoutError(),
+            openai.APITimeoutError(request=httpx.Request("POST", "https://x")),
+        ):
+            post = AsyncMock(side_effect=[exc, self._ok_response()])
+            with patch.object(noma_v2_guardrail.async_handler, "post", post):
+                result = await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+            assert result == {"action": "NONE"}
+            assert post.await_count == 2, f"{type(exc).__name__} must be retried"
+
+    @pytest.mark.asyncio
+    async def test_retry_shares_the_original_budget(self, noma_v2_guardrail):
+        """The retry must NOT restart scan_timeout.
+
+        A fresh budget per attempt would let two attempts spend 2x the wall-clock ceiling
+        that ARC-BUG-43 promises the caller. Asserted on the payload the code computes —
+        the second attempt's wait_for budget — rather than on a call count, because a
+        count cannot distinguish a shared budget from a reset one.
+        """
+        noma_v2_guardrail.scan_timeout = 10.0
+        budgets: list[float] = []
+        real_wait_for = asyncio.wait_for
+
+        async def recording_wait_for(aw, timeout):
+            budgets.append(timeout)
+            return await real_wait_for(aw, timeout)
+
+        post = AsyncMock(side_effect=[httpx.ReadTimeout("Timeout on reading data from socket"), self._ok_response()])
+        with patch.object(noma_v2_guardrail.async_handler, "post", post):
+            with patch("asyncio.wait_for", recording_wait_for):
+                await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+
+        assert len(budgets) == 2
+        assert budgets[0] == 10.0
+        assert budgets[1] < budgets[0], "the retry must inherit the remaining budget, not a fresh one"
+
+    @pytest.mark.asyncio
+    async def test_no_retry_once_the_budget_can_no_longer_fit_one(self, noma_v2_guardrail):
+        """The budget guard bounds retries even when every failure still looks retryable.
+
+        Only reachable with more than one retry allowed. On the default MAX=1 the guard is
+        unreachable by construction: a failure fast enough to qualify (< 5% of the budget)
+        always leaves > 95% remaining, which always clears the threshold. Asserting it through
+        the default path would assert nothing, so the retry count is raised here to exercise
+        the code that actually stops the loop.
+
+        [ARC-BUG-47 review] The first version of this test slept 0.25s against a 0.26s
+        threshold — a 9ms margin. Under CPU load the sleep overshot and the THRESHOLD declined
+        the retry rather than the budget guard, so on a loaded runner it passed 30/30 even with
+        the budget guard deleted. It now drives the clock directly instead of racing it.
+        """
+        noma_v2_guardrail.scan_timeout = 60.0
+        # Each attempt charges 2.5s of budget while staying under the 3.0s fast-fail window
+        # (5% of 60s), so the THRESHOLD always says "retryable" and only the budget guard can
+        # end the loop. Driving the clock rather than sleeping keeps that exact.
+        charge = 2.5
+        clock = {"t": 0.0}
+
+        def fake_monotonic():
+            return clock["t"]
+
+        async def fail_fast(*args, **kwargs):
+            clock["t"] += charge
+            raise httpx.ReadTimeout("socket")
+
+        real_monotonic = time.monotonic
+        post = AsyncMock(side_effect=fail_fast)
+        with patch.object(nv2, "NOMA_CONNECTION_RETRY_MAX", 999):
+            with patch.object(nv2.time, "monotonic", fake_monotonic):
+                with patch.object(noma_v2_guardrail.async_handler, "post", post):
+                    # The guard's observable effect is the exception the CALLER sees. Without it
+                    # the loop keeps going until asyncio.wait_for is handed a non-positive budget
+                    # and raises TimeoutError itself, burying the real cause. With it, the last
+                    # genuine failure propagates. Asserting the exact type is what makes this a
+                    # test of the guard rather than of the attempt count — measured: attempts are
+                    # 24 either way, so a count assertion cannot tell the two apart.
+                    with pytest.raises(httpx.ReadTimeout):
+                        await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+        assert time.monotonic is real_monotonic, "the clock patch must not leak"
+
+        # 60s of budget at 2.5s per attempt: ~24 attempts, then the budget guard stops it —
+        # far short of the 999 the counter would allow.
+        assert 2 <= post.await_count <= 30, f"budget guard should stop it, got {post.await_count}"
+
+    @pytest.mark.asyncio
+    async def test_a_retried_fast_failure_is_not_relabelled_deadline_exceeded(self, noma_v2_guardrail):
+        """[ARC-BUG-47 review, finding 3] The retry must not corrupt ARC-BUG-43's own marker.
+
+        apply_guardrail measures elapsed from its own start, so it sums ALL attempts. Left
+        alone, enough retried fast failures push the total past 0.9 * scan_timeout and the event
+        logs "DEADLINE EXCEEDED" — inverting the exact marker ARC-BUG-43 exists to make
+        trustworthy: a connection failure would masquerade as a slow Noma. Classification
+        therefore reads the LAST ATTEMPT's duration, while the log and audit record keep total
+        wall-clock, which is what the caller actually waited.
+
+        ℹ️ Reaching the defect requires MAX > 1, and that is worth stating rather than hiding:
+        at the shipped MAX=1 the sum of two attempts is bounded by 2 * 5% = 10% of the budget,
+        which can never reach the 90% expiry line. So the retry ceiling already makes this
+        unreachable in production, and this fix is defensive. The test patches the retry count
+        to reach the code at all — asserting the invariant rather than today's configuration,
+        because a future bump to MAX would otherwise silently reintroduce the relabel.
+        """
+        noma_v2_guardrail.scan_timeout = 60.0
+        noma_v2_guardrail.monitor_mode = True
+
+        # 2.5s per attempt: inside the 3.0s fast-fail window (5% of 60s) so every attempt is
+        # judged retryable, and 19+ of them sum past 54.0s (90% of 60s) — the relabel zone.
+        clock = {"t": 0.0}
+
+        async def fail_fast_but_expensive(*args, **kwargs):
+            clock["t"] += 2.5
+            raise httpx.ReadTimeout("socket")
+
+        post = AsyncMock(side_effect=fail_fast_but_expensive)
+        request_data: dict = {"metadata": {}}
+
+        # apply_guardrail measures its own elapsed with datetime.now(), NOT time.monotonic —
+        # patching only monotonic left the classifier seeing 0.002s and the test passing for
+        # the wrong reason, which is exactly what the negative control caught. Both clocks
+        # must advance together for the sum to reach the relabel zone.
+        class _FakeDatetime(nv2.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return nv2.datetime.fromtimestamp(clock["t"], tz) if tz else nv2.datetime.fromtimestamp(clock["t"])
+
+        with patch.object(nv2, "NOMA_CONNECTION_RETRY_MAX", 999):
+            with patch.object(nv2, "datetime", _FakeDatetime):
+                with patch.object(nv2.time, "monotonic", lambda: clock["t"]):
+                    with patch.object(noma_v2_guardrail.async_handler, "post", post):
+                        await noma_v2_guardrail.apply_guardrail(
+                            inputs={"texts": ["hello"]},
+                            request_data=request_data,
+                            input_type="request",
+                            logging_obj=None,
+                        )
+
+        assert post.await_count > 18, (
+            f"the test must actually reach the relabel zone, only got {post.await_count} attempts"
+        )
+        entries = request_data["metadata"]["standard_logging_guardrail_information"]
+        assert len(entries) == 1, "a retried scan still produces exactly one audit record"
+        response = entries[0]["guardrail_response"]
+        assert response["timed_out"] is False, (
+            "fast failures summing past 0.9x the budget must NOT be filed as a deadline expiry"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_retry_is_bounded_by_its_own_ceiling_not_the_remaining_budget(self, noma_v2_guardrail):
+        """[ARC-BUG-47 review] The blocker: an unbounded retry is worse than the bug.
+
+        Attempt 1 dies in milliseconds — the bug's signature. If the retry then inherits the
+        whole remaining budget and hangs, the request pays the full scan_timeout inside a
+        guardrail that today costs it 40ms and lets it through. pre_call is ON the request
+        path and cannot be detached, so at scan_timeout=10 that is ~9x the p50 request budget.
+
+        Asserted on the budget handed to the retry, not on wall-clock, so the test states the
+        invariant rather than racing a sleep.
+        """
+        noma_v2_guardrail.scan_timeout = 10.0
+        budgets: list[float] = []
+        real_wait_for = asyncio.wait_for
+
+        async def recording_wait_for(aw, timeout):
+            budgets.append(timeout)
+            return await real_wait_for(aw, timeout)
+
+        post = AsyncMock(side_effect=[httpx.ReadTimeout("socket"), self._ok_response()])
+        with patch.object(noma_v2_guardrail.async_handler, "post", post):
+            with patch("asyncio.wait_for", recording_wait_for):
+                await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+
+        assert len(budgets) == 2
+        assert budgets[0] == 10.0, "attempt 1 gets the full budget"
+        assert budgets[1] <= nv2.NOMA_CONNECTION_RETRY_CEILING_SECONDS, (
+            f"the retry must be capped at the ceiling, got {budgets[1]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_retry_is_reachable_below_the_connect_budget(self, noma_v2_guardrail):
+        """[ARC-BUG-47 review] The silent config cliff, found independently by two reviews.
+
+        The first version compared the remaining budget against
+        min(HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS, scan_timeout). For any scan_timeout <= 5.0
+        that min() collapsed to scan_timeout itself, making the test
+        (scan_timeout - elapsed) > scan_timeout — false for every positive elapsed. Measured
+        cliff: 0.1-5.0 never retried, 5.01+ retried.
+
+        That matters because initialize_guardrail_v2 CLAMPS a generic timeout into
+        [0.1, 60.0] rather than rejecting it, so an operator tightening a guardrail to 3s to
+        bound tail latency would have silently shipped a pod reporting the fix as active while
+        ~24% of its scans still passed uninspected.
+        """
+        for scan_timeout in (0.5, 2.0, 3.0, 5.0):
+            noma_v2_guardrail.scan_timeout = scan_timeout
+            post = AsyncMock(side_effect=[httpx.ReadTimeout("socket"), self._ok_response()])
+            with patch.object(noma_v2_guardrail.async_handler, "post", post):
+                result = await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+            assert result == {"action": "NONE"}
+            assert post.await_count == 2, f"scan_timeout={scan_timeout} must still retry"
+
+    @pytest.mark.asyncio
+    async def test_env_kill_switch_restores_the_prior_behaviour(self, noma_v2_guardrail):
+        """[ARC-BUG-47 review] NOMA_CONNECTION_RETRY_MAX=0 must fully disable the retry.
+
+        This ships as a second production change in one day; without a runtime lever the only
+        rollback is an image rebuild plus a rolling restart of every proxy pod.
+        """
+        post = AsyncMock(side_effect=httpx.ReadTimeout("socket"))
+        with patch.object(nv2, "NOMA_CONNECTION_RETRY_MAX", 0):
+            with patch.object(noma_v2_guardrail.async_handler, "post", post):
+                with pytest.raises(httpx.ReadTimeout):
+                    await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+
+        assert post.await_count == 1, "kill switch must leave exactly the pre-fix behaviour"
+
+    @pytest.mark.asyncio
+    async def test_the_retry_is_logged_with_both_numbers(self, noma_v2_guardrail, caplog):
+        """Operators need to see WHY a retry happened, and the measured elapsed time.
+
+        ARC-BUG-43 shipped a version that printed only the configured budget in the slot
+        that reads as elapsed time, so every line claimed "after 10.0s" including 2ms
+        failures. Both numbers, measured one first.
+        """
+        import logging
+
+        post = AsyncMock(side_effect=[httpx.ReadTimeout("Timeout on reading data from socket"), self._ok_response()])
+        with caplog.at_level(logging.WARNING):
+            with patch.object(noma_v2_guardrail.async_handler, "post", post):
+                await noma_v2_guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+
+        assert "broken pooled connection" in caplog.text
+        assert "ReadTimeout" in caplog.text
+        assert noma_v2_guardrail.guardrail_name in caplog.text
+
+        # [ARC-BUG-47 review] Pin the ORDER, not just the presence of numbers. Substring
+        # assertions alone let a reviewer swap attempt_elapsed and scan_timeout in the format
+        # args -- recreating verbatim the ARC-BUG-43 bug this docstring cites -- with the test
+        # still green. The measured time must come first and must not be the budget.
+        import re as _re
+
+        m = _re.search(r"scan failed after ([\d.]+)s with (\w+), far below the ([\d.]+)s budget", caplog.text)
+        assert m, f"the WARNING must keep its measured-first shape, got: {caplog.text[:300]}"
+        measured, exc_name, budget = float(m.group(1)), m.group(2), float(m.group(3))
+        assert budget == noma_v2_guardrail.scan_timeout, "the second number must be the budget"
+        assert measured < budget, f"measured {measured}s must be below the budget {budget}s"
+        assert exc_name == "ReadTimeout"
+        # hook, so an operator can tell the on-path pre_call leg from a side hook.
+        assert "hook=" in caplog.text
+
+        # [ARC-BUG-47 review] Lock the no-PHI property of this CloudWatch-bound line.
+        # This file's own comments state the split explicitly: container logs carry NO PHI,
+        # while the audit record deliberately does. A narrow mutation adding str(e) to the log
+        # argument passed all 104 tests, so nothing held the property the code already has.
+        # str(e) for the three timeout types is 'timed out' / '' / 'Request timed out.', but
+        # litellm.Timeout stringifies with the URL and a future exception type could carry more.
+        assert "Timeout on reading data from socket" not in caplog.text, (
+            "the exception's own message must not reach the container log"
+        )

@@ -9,6 +9,7 @@ import enum
 import json
 import math
 import os
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, List, Literal, Optional, Type, cast
 from urllib.parse import urlparse
@@ -19,6 +20,8 @@ import openai
 from litellm._logging import verbose_proxy_logger
 from litellm.constants import (
     HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS,
+    NOMA_CONNECTION_RETRY_CEILING_SECONDS,
+    NOMA_CONNECTION_RETRY_MAX,
     NOMA_MAX_SCAN_TIMEOUT_SECONDS,
     NOMA_MIN_SCAN_TIMEOUT_SECONDS,
     NOMA_SCAN_TIMEOUT_SECONDS,
@@ -69,6 +72,32 @@ _TIMEOUT_EXCEPTIONS: tuple = (
 # early still spent the budget; generous enough that a late-firing ceiling (an event-loop
 # stall delays asyncio.wait_for) is not misfiled as a fast failure.
 _DEADLINE_ELAPSED_TOLERANCE: float = 0.9
+
+# [ARC-BUG-47] Fraction of the budget below which a timeout-typed failure is read as a broken
+# connection rather than an expired deadline, and therefore retried once.
+#
+# aiohttp raises SocketTimeoutError when a connection breaks WHILE READING, not only when a read
+# budget expires, and litellm's transport maps that to httpx.ReadTimeout
+# (aiohttp_transport.py: `aiohttp.SocketTimeoutError: httpx.ReadTimeout`). So a pooled keep-alive
+# the peer has already closed — Noma sits behind Cloudflare, which recycles idle connections
+# sooner than the client pool expires them — surfaces as a timeout that arrives in single-digit
+# milliseconds against a 10s budget. Measured on prd-ai: 74 such failures in ~25 minutes,
+# elapsed p50 0.036s, max 0.093s, i.e. ~24% of scans never reached the vendor while every
+# counter recorded success.
+#
+# Deliberately an order of magnitude below _DEADLINE_ELAPSED_TOLERANCE rather than adjacent to
+# it, leaving the 0.05–0.9 band as neither-retried-nor-counted-as-expiry. A scan that genuinely
+# spent a tenth of its budget before failing is doing real work against a real peer; retrying
+# that risks doubling latency on a Noma that is merely slow, which is the failure mode
+# ARC-BUG-20 and 43 exist to bound. The gap is the safety margin, not an oversight.
+_CONNECTION_FAILURE_ELAPSED_FRACTION: float = 0.05
+
+# Why one retry rather than a loop, and where the knobs live: the scan POST is idempotent, so a
+# second attempt is safe, and a stale pooled connection is cured by the fresh one the first
+# failure already forced. If a newly-established connection also fails this fast, reuse is not
+# the problem. NOMA_CONNECTION_RETRY_MAX and NOMA_CONNECTION_RETRY_CEILING_SECONDS live in
+# constants.py and read the environment, so the retry can be switched off at runtime
+# (NOMA_CONNECTION_RETRY_MAX=0) without an image rebuild.
 
 _DEFAULT_API_BASE = "https://api.noma.security/"
 _AIDR_SCAN_ENDPOINT = "/litellm/guardrail"
@@ -309,15 +338,90 @@ class NomaV2Guardrail(CustomGuardrail):
             timeout=self.scan_timeout,
             connect=min(HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS, self.scan_timeout),
         )
-        response = await asyncio.wait_for(
-            self.async_handler.post(
-                url=endpoint,
-                headers=headers,
-                json=sanitized_payload,
-                timeout=request_timeout,
-            ),
-            timeout=self.scan_timeout,
-        )
+        # [ARC-BUG-47] Retry once when a timeout-typed failure arrives far too early to be a real
+        # deadline: that shape is a broken pooled connection, and the transport's exception map
+        # disguises it as a timeout. See _CONNECTION_FAILURE_ELAPSED_FRACTION.
+        #
+        # The retry deliberately shares the ORIGINAL budget rather than restarting it. A fresh
+        # scan_timeout per attempt would let two attempts spend 2x the ceiling that ARC-BUG-43
+        # exists to enforce, which is the opposite of the intent — the whole point of that bug is
+        # that scan_timeout is a wall-clock guarantee to the caller, not a per-attempt allowance.
+        deadline_budget = self.scan_timeout
+        attempt = 0
+        while True:
+            # The retry gets its OWN ceiling, not the whole remainder. Inheriting the remainder
+            # would turn a 36ms failure into a request blocked for the full scan_timeout — see
+            # NOMA_CONNECTION_RETRY_CEILING_SECONDS. Still bounded by the shared budget so the
+            # two attempts together cannot exceed ARC-BUG-43's wall-clock guarantee.
+            attempt_budget = (
+                deadline_budget if attempt == 0 else min(deadline_budget, NOMA_CONNECTION_RETRY_CEILING_SECONDS)
+            )
+            attempt_started = time.monotonic()
+            self._last_scan_attempt_elapsed = None
+            try:
+                response = await asyncio.wait_for(
+                    self.async_handler.post(
+                        url=endpoint,
+                        headers=headers,
+                        json=sanitized_payload,
+                        timeout=request_timeout,
+                    ),
+                    timeout=attempt_budget,
+                )
+                break
+            except Exception as e:
+                attempt_elapsed = time.monotonic() - attempt_started
+                deadline_budget -= attempt_elapsed
+                # [ARC-BUG-47] Hand the LAST attempt's own duration to the ARC-BUG-43
+                # classifier. Without it that classifier sums both attempts and can relabel a
+                # fast connection failure as DEADLINE EXCEEDED — inverting the very marker
+                # ARC-BUG-43 exists to make trustworthy. Reproduced at scan_timeout=6.0:
+                # attempt 1 at 0.25s plus attempt 2 at 5.2s reported "DEADLINE EXCEEDED after
+                # 5.452s" although neither attempt came near the budget.
+                self._last_scan_attempt_elapsed = attempt_elapsed
+                looks_like_connection_failure = (
+                    isinstance(e, _TIMEOUT_EXCEPTIONS)
+                    and attempt_elapsed < self.scan_timeout * _CONNECTION_FAILURE_ELAPSED_FRACTION
+                )
+                # A retry that cannot complete inside what is left would burn the caller's
+                # deadline to return the same failure.
+                #
+                # Compared against the RETRY's own ceiling, not the connect budget. Comparing
+                # against min(connect, scan_timeout) made the whole fix unreachable for any
+                # scan_timeout <= 5.0: min() collapsed to scan_timeout, so the test became
+                # (scan_timeout - elapsed) > scan_timeout, false for every positive elapsed.
+                # Measured cliff: 0.1-5.0 never retried, 5.01+ retried. Two independent reviews
+                # found it, and initialize_guardrail_v2 CLAMPS a generic timeout into
+                # [0.1, 60.0] rather than rejecting it — so an operator tightening a guardrail
+                # to 3s would have silently shipped a pod that reports the fix as active while
+                # ~24% of its scans still pass uninspected.
+                budget_left_for_a_retry = deadline_budget > min(
+                    NOMA_CONNECTION_RETRY_CEILING_SECONDS, self.scan_timeout * _CONNECTION_FAILURE_ELAPSED_FRACTION
+                )
+                if (
+                    not looks_like_connection_failure
+                    or attempt >= NOMA_CONNECTION_RETRY_MAX
+                    or not budget_left_for_a_retry
+                ):
+                    raise
+                attempt += 1
+                # hook=%s to match both sibling ERROR lines: four hooks are default_on and only
+                # pre_call sits on the request path, so an operator needs to know which one is
+                # retrying to tell whether users are feeling it. Read from the payload rather
+                # than self, because _call_noma_scan does not receive input_type and self carries
+                # the configured event_hook, which is not the same thing as the leg being scanned.
+                verbose_proxy_logger.warning(
+                    "Noma v2 scan failed after %.3fs with %s, far below the %ss budget — reading "
+                    "this as a broken pooled connection and retrying once on a fresh one. "
+                    "guardrail=%s hook=%s remaining_budget=%.3fs retry_ceiling=%ss",
+                    attempt_elapsed,
+                    type(e).__name__,
+                    self.scan_timeout,
+                    self.guardrail_name,
+                    payload.get("input_type", "unknown"),
+                    deadline_budget,
+                    NOMA_CONNECTION_RETRY_CEILING_SECONDS,
+                )
         verbose_proxy_logger.debug(
             "Noma v2 AIDR response: status_code=%s body=%s",
             response.status_code,
@@ -450,6 +554,14 @@ class NomaV2Guardrail(CustomGuardrail):
         except Exception as e:
             guardrail_status = "guardrail_failed_to_respond"
             elapsed = (datetime.now() - start_time).total_seconds()
+            # [ARC-BUG-47] Classify on the last ATTEMPT's duration, not the sum across a retry.
+            # `elapsed` still reports total wall-clock in the log and audit record, which is
+            # what a caller waited; only the expiry test uses the per-attempt figure, because
+            # "did this scan burn its budget" is a question about one attempt.
+            attempt_elapsed_for_classification = getattr(self, "_last_scan_attempt_elapsed", None)
+            classify_on = (
+                attempt_elapsed_for_classification if attempt_elapsed_for_classification is not None else elapsed
+            )
             # [ARC-BUG-43] Classify on MEASURED time, not on the exception type alone.
             #
             # The type is necessary but not sufficient. The shared HTTP handler re-raises
@@ -465,7 +577,7 @@ class NomaV2Guardrail(CustomGuardrail):
             # wall-clock ceiling can fire late if the event loop was blocked (measured: a
             # 7.4s stall from a lazy synchronous import delayed a 2s deadline to 9.4s).
             timeout_type = isinstance(e, _TIMEOUT_EXCEPTIONS)
-            timed_out = timeout_type and elapsed >= self.scan_timeout * _DEADLINE_ELAPSED_TOLERANCE
+            timed_out = timeout_type and classify_on >= self.scan_timeout * _DEADLINE_ELAPSED_TOLERANCE
             # [ARC-BUG-43] A dict rather than a bare str(e), for structure: it carries the
             # timed_out flag and the budget that expired, and it keeps an explanation for
             # exceptions whose str() is empty (httpx ConnectTimeout stringifies to '').

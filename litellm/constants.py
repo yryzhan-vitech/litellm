@@ -191,6 +191,26 @@ NOMA_MIN_SCAN_TIMEOUT_SECONDS: float = 0.1
 # bounding the tail well under the 600s it replaces.
 NOMA_MAX_SCAN_TIMEOUT_SECONDS: float = 60.0
 
+# [ARC-BUG-47] How many times a scan may be retried when the failure shape says the pooled
+# connection broke rather than the deadline expiring. Env-readable so the retry can be switched
+# off at runtime: 0 restores exactly the pre-ARC-BUG-47 behaviour without an image rebuild and a
+# rolling restart of every proxy pod, which is otherwise the only lever.
+NOMA_CONNECTION_RETRY_MAX: int = get_env_int("NOMA_CONNECTION_RETRY_MAX", 1)
+
+# [ARC-BUG-47] Ceiling on the RETRY's own attempt, independent of what remains of the scan budget.
+#
+# Without it the retry inherits the whole remaining budget, which converts the bug's own signature
+# — a failure in milliseconds — into a request that blocks for the full scan_timeout. Measured at
+# production values (scan_timeout 10.0): attempt 1 dies at 36ms, a retry into a struggling backend
+# hangs, and the request pays 10.00s inside the guardrail where today it pays 0.04s and proceeds
+# unscanned. pre_call is ON the request path and cannot be detached (ARC-BUG-20), so that is ~9x
+# the entire p50 request budget.
+#
+# 1.0s is two orders of magnitude above what is being retried: Noma's measured p50 is 0.027s and
+# p99 0.383s across 31 days and 512k scans. A broken-connection retry either completes in tens of
+# milliseconds or will not complete at all, so granting it the full budget buys nothing.
+NOMA_CONNECTION_RETRY_CEILING_SECONDS: float = get_env_float("NOMA_CONNECTION_RETRY_CEILING_SECONDS", 1.0)
+
 # Metadata key recording which pre_call guardrails the proxy loop already ran,
 # so the deployment-level hook does not re-run them for the same request
 PRE_CALL_EXECUTED_GUARDRAILS_KEY = "_pre_call_executed_guardrails"
