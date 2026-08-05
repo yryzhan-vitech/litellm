@@ -460,8 +460,18 @@ async def test_max_uses_zero_raises_on_first_advisor_call():
 
 
 @pytest.mark.asyncio
-async def test_missing_advisor_model_raises_value_error():
-    """handle() must raise ValueError when the advisor tool has no model field."""
+async def test_missing_advisor_model_raises_bad_request_error():
+    """handle() must reject an advisor tool with no model field as a 400, not a 500.
+
+    [ARC-BUG-46] This asserted `ValueError` and had been red since bca9dabfa5b, because that fix
+    deliberately replaced the bare ValueError with BadRequestError — a bare ValueError carries no
+    status_code, so the proxy defaulted to 500 and paged on what is caller input.
+    BadRequestError does NOT subclass ValueError, so the old assertion could never pass again.
+
+    ARC-BUG-46 updated its own suite (test_advisor_integration.py) and missed this sibling file;
+    fork PR #74 later touched three credential assertions here and missed this fourth. Confirmed
+    live on dev-ai: six malformed advisor shapes all return 400 with this message, never 500.
+    """
     from litellm.llms.anthropic.experimental_pass_through.messages.interceptors.advisor import (
         AdvisorOrchestrationHandler,
     )
@@ -469,7 +479,7 @@ async def test_missing_advisor_model_raises_value_error():
     advisor_tool_no_model = {"type": "advisor_20260301", "name": "advisor"}
 
     h = AdvisorOrchestrationHandler()
-    with pytest.raises(ValueError, match="model"):
+    with pytest.raises(BadRequestError, match="model") as exc_info:
         await h.handle(
             model="openai/gpt-4o-mini",
             messages=MESSAGES,
@@ -478,6 +488,10 @@ async def test_missing_advisor_model_raises_value_error():
             max_tokens=512,
             custom_llm_provider="openai",
         )
+
+    # The status code is the whole point of ARC-BUG-46: a malformed tool is the caller's
+    # mistake, so it must not page as a server fault.
+    assert exc_info.value.status_code == 400
 
 
 # ---------------------------------------------------------------------------
