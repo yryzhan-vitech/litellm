@@ -2170,3 +2170,170 @@ async def test_run_guardrail_with_metrics_does_not_report_cancelled_as_success()
     assert emitted, "the finally block must still emit a metric"
     assert emitted[-1]["status"] != "success"
     assert emitted[-1]["error_type"] == "CancelledError"
+
+
+@pytest.mark.asyncio
+async def test_run_guardrail_with_metrics_does_not_report_fail_open_as_success():
+    """A fail-open guardrail that never reached the vendor must not be counted as a pass.
+
+    Third instance of the defect the cancelled-status test above fixed, and the same root cause:
+    this wrapper derives `status` purely from what escapes the coroutine, so it can only ever learn
+    about failures that raise. `block_failures: false` makes a guardrail catch its OWN failure and
+    return the inputs unchanged — nothing escapes, and a response that was never scanned is
+    recorded as `status="success"`.
+
+    Measured on dev-ai: 9 log lines reading "content was NOT scanned" against
+    `litellm_guardrail_requests_total` carrying ONLY `status="success"`. The correct status was
+    computed all along and reached the audit record — it just never reached Prometheus. The fix
+    publishes it through a ContextVar so the wrapper is told rather than left to infer.
+    """
+    from litellm.integrations.custom_guardrail import _LAST_GUARDRAIL_STATUS
+
+    emitted: list = []
+
+    async def _fails_open():
+        # Exactly what apply_guardrail does under block_failures=False: report, then return.
+        _LAST_GUARDRAIL_STATUS.set("guardrail_failed_to_respond")
+        return {"texts": ["unchanged"]}
+
+    callback = _StubMonitorOnlyGuardrail(guardrail_name="noma-fail-open-probe")
+
+    with patch.object(ProxyLogging, "_emit_guardrail_metrics", staticmethod(lambda **kw: emitted.append(kw))):
+        out = await ProxyLogging._run_guardrail_with_metrics(callback, _fails_open(), "post_call")
+
+    assert out == {"texts": ["unchanged"]}, "fail-open must still return the inputs untouched"
+    assert emitted, "the finally block must still emit a metric"
+    assert emitted[-1]["status"] == "guardrail_failed_to_respond"
+    assert emitted[-1]["error_type"] == "guardrail_failed_to_respond"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reported, expected",
+    [
+        ("success", "success"),
+        (None, "success"),
+    ],
+    ids=["guardrail-reports-success", "guardrail-reports-nothing"],
+)
+async def test_run_guardrail_with_metrics_leaves_the_working_paths_alone(reported, expected):
+    """The fix must not relabel anything that was already correct.
+
+    A guardrail that succeeds, and one that never calls the audit hook at all (most non-Noma
+    guardrails), both have to keep reading `success` — otherwise every clean scan in the fleet
+    starts reporting a failure.
+    """
+    from litellm.integrations.custom_guardrail import _LAST_GUARDRAIL_STATUS
+
+    emitted: list = []
+
+    async def _ok():
+        if reported is not None:
+            _LAST_GUARDRAIL_STATUS.set(reported)
+        return {"texts": ["scanned"]}
+
+    callback = _StubMonitorOnlyGuardrail(guardrail_name="noma-clean-probe")
+    with patch.object(ProxyLogging, "_emit_guardrail_metrics", staticmethod(lambda **kw: emitted.append(kw))):
+        await ProxyLogging._run_guardrail_with_metrics(callback, _ok(), "pre_call")
+
+    assert emitted[-1]["status"] == expected
+    assert emitted[-1]["error_type"] is None
+
+
+@pytest.mark.asyncio
+async def test_an_escaping_exception_outranks_the_self_reported_status():
+    """When a guardrail both reports a failure AND raises, the exception is the better signal.
+
+    `error` carries the exception class in `error_type`, which is what an operator needs to tell a
+    Noma outage from a bug in our own code. Letting the self-reported string win would flatten every
+    such case into one label.
+    """
+    from litellm.integrations.custom_guardrail import _LAST_GUARDRAIL_STATUS
+
+    emitted: list = []
+
+    async def _reports_then_raises():
+        _LAST_GUARDRAIL_STATUS.set("guardrail_failed_to_respond")
+        raise RuntimeError("boom")
+
+    callback = _StubMonitorOnlyGuardrail(guardrail_name="noma-raise-probe")
+    with patch.object(ProxyLogging, "_emit_guardrail_metrics", staticmethod(lambda **kw: emitted.append(kw))):
+        with pytest.raises(RuntimeError):
+            await ProxyLogging._run_guardrail_with_metrics(callback, _reports_then_raises(), "post_call")
+
+    assert emitted[-1]["status"] == "error"
+    # 🔴 error_type is the load-bearing assertion. status would read "error" either way in some
+    # orderings; it is `error_type` that a self-reported string overwrites, and an operator needs the
+    # exception CLASS here to tell a Noma outage from a bug in our own code.
+    assert emitted[-1]["error_type"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_one_hooks_failure_does_not_bleed_into_the_next():
+    """pre_call, during_call and post_call run inside ONE request context.
+
+    Without a reset at the top of the wrapper, a clean post_call would read pre_call's failure and
+    report a scan that succeeded as one that failed — the mirror image of the bug being fixed, and
+    exactly the mistake already recorded inside noma_v2.apply_guardrail for its own ContextVar.
+    """
+    from litellm.integrations.custom_guardrail import _LAST_GUARDRAIL_STATUS
+
+    emitted: list = []
+
+    async def _fails_open():
+        _LAST_GUARDRAIL_STATUS.set("guardrail_failed_to_respond")
+        return {"texts": ["x"]}
+
+    async def _never_reports():
+        return {"texts": ["x"]}
+
+    callback = _StubMonitorOnlyGuardrail(guardrail_name="noma-bleed-probe")
+    with patch.object(ProxyLogging, "_emit_guardrail_metrics", staticmethod(lambda **kw: emitted.append(kw))):
+        await ProxyLogging._run_guardrail_with_metrics(callback, _fails_open(), "pre_call")
+        # 🔴 Set it OUT OF BAND before the second call. A negative control caught the first version
+        # of this test passing with the reset deleted: `_fails_open` sets the var inside its own
+        # coroutine, and a bare `await` runs that in the caller's context, so the write was already
+        # visible — the reset had nothing to prove. Writing it here reproduces what actually happens
+        # in the proxy, where pre_call's value survives into post_call's wrapper invocation.
+        _LAST_GUARDRAIL_STATUS.set("guardrail_failed_to_respond")
+        await ProxyLogging._run_guardrail_with_metrics(callback, _never_reports(), "post_call")
+
+    assert emitted[0]["status"] == "guardrail_failed_to_respond"
+    assert emitted[1]["status"] == "success", "post_call inherited pre_call's failure"
+
+
+@pytest.mark.asyncio
+async def test_the_real_noma_guardrail_reports_an_unscanned_response():
+    """End to end through the shipped guardrail, not a stand-in.
+
+    The stub tests above all set the ContextVar by hand, so they would pass even if
+    `add_standard_logging_guardrail_information_to_request_data` never published it. This drives the
+    real NomaV2Guardrail with a dead scan and asserts both halves at once: fail-open still returns
+    the inputs, and the metric no longer says success.
+    """
+    from litellm.proxy.guardrails.guardrail_hooks.noma.noma_v2 import NomaV2Guardrail
+
+    emitted: list = []
+    guardrail = NomaV2Guardrail(
+        guardrail_name="noma-post-call",
+        api_key="probe-key",
+        api_base="https://noma.invalid",
+        monitor_mode=True,
+        block_failures=False,
+    )
+
+    async def _dead_connection(*args, **kwargs):
+        raise TimeoutError("connection died")
+
+    guardrail._call_noma_scan = _dead_connection  # type: ignore[method-assign]
+
+    inputs = {"texts": ["some content"]}
+    with patch.object(ProxyLogging, "_emit_guardrail_metrics", staticmethod(lambda **kw: emitted.append(kw))):
+        out = await ProxyLogging._run_guardrail_with_metrics(
+            guardrail,
+            guardrail.apply_guardrail(inputs=inputs, request_data={"metadata": {}}, input_type="response"),
+            "post_call",
+        )
+
+    assert out == inputs, "block_failures=False must keep failing open"
+    assert emitted[-1]["status"] != "success", "an unscanned response must not read as a success"

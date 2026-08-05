@@ -1617,10 +1617,18 @@ class ProxyLogging:
         enriching any raised HTTPException with the originating callback's
         `guardrail_name`/`guardrail_mode` before re-raising.
         """
+        from litellm.integrations.custom_guardrail import _LAST_GUARDRAIL_STATUS
+
         guardrail_name = getattr(callback, "guardrail_name", None) or type(callback).__name__
         start_time = time.perf_counter()
         status = "success"
         error_type: Optional[str] = None
+        # [ARC-BUG-20] Clear before the call so a self-reported status can never be inherited from
+        # an earlier hook in the same context. pre_call, during_call and post_call all run inside
+        # ONE request context, so without this a clean post_call would read pre_call's failure.
+        # (The mirror-image of this exact bug is recorded in noma_v2.apply_guardrail — same class of
+        # mistake, opposite direction.)
+        _LAST_GUARDRAIL_STATUS.set(None)
         try:
             return await coro
         except SensitiveDataRouteException:
@@ -1643,6 +1651,20 @@ class ProxyLogging:
             _enrich_http_exception_with_guardrail_context(e, callback)
             raise
         finally:
+            # [ARC-BUG-20] Prefer the status the guardrail COMPUTED over the one inferred here.
+            # Only consulted when nothing escaped, because an escaping exception is the more
+            # specific signal — a guardrail that both reported a failure AND raised is an
+            # `error`/`intervened`/`cancelled` case, and those arms already set `status`.
+            #
+            # This closes the fail-open blind spot: `block_failures: false` makes a guardrail catch
+            # its own failure and return the inputs, so nothing escapes and this wrapper had no way
+            # to know the content went unscanned. Nine such events on dev-ai sat behind a
+            # 100%-success dashboard.
+            if status == "success":
+                self_reported = _LAST_GUARDRAIL_STATUS.get()
+                if self_reported is not None and self_reported != "success":
+                    status = self_reported
+                    error_type = error_type or self_reported
             ProxyLogging._emit_guardrail_metrics(
                 guardrail_name=guardrail_name,
                 latency_seconds=time.perf_counter() - start_time,

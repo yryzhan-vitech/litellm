@@ -1,5 +1,6 @@
 import os
 import secrets
+from contextvars import ContextVar
 from datetime import datetime
 from typing import (
     TYPE_CHECKING,
@@ -59,6 +60,29 @@ from litellm.exceptions import (
 # field to suppress a guardrail on the direct-SDK path that never reaches the
 # proxy's metadata sanitizer.
 _PRE_CALL_EXECUTED_TOKEN = secrets.token_hex(16)
+
+# [ARC-BUG-20] The status a guardrail COMPUTED, published so the metrics wrapper can read it
+# instead of inferring one from an exception.
+#
+# ProxyLogging._run_guardrail_with_metrics derives its `status` label purely from what escapes
+# the coroutine: no exception means `status="success"`. That was sound when it was written, but a
+# fail-open guardrail (`block_failures: false`) catches its own failure and RETURNS the inputs
+# unchanged — so nothing escapes, and a scan that never reached the vendor is counted as one that
+# passed. Measured on dev-ai: 9 log lines reading "content was NOT scanned" against
+# litellm_guardrail_requests_total carrying ONLY status="success", and no
+# litellm_guardrail_errors_total series at all. The correct status was computed all along and
+# reached the audit record; it simply never reached Prometheus.
+#
+# This is the same defect ARC-BUG-20 already fixed in two other arms of that same try block
+# (CancelledError being a BaseException, so it slipped past `except Exception` and the `finally`
+# emitted the initialised "success"). Third instance, same root cause: the wrapper cannot learn a
+# status it is not told.
+#
+# A ContextVar rather than an argument because the wrapper receives only (callback, coro,
+# hook_type) — it never sees `request_data`, which is where the audit record goes. Per-context by
+# construction, so concurrent requests and the fire-and-forget during_call task cannot read each
+# other's value.
+_LAST_GUARDRAIL_STATUS: ContextVar[Optional[str]] = ContextVar("litellm_last_guardrail_status", default=None)
 
 
 def _strict_guardrail_modes_enabled() -> bool:
@@ -819,6 +843,11 @@ class CustomGuardrail(CustomLogger):
         )
 
         clean_guardrail_response = mask_credentials_in_payload(clean_guardrail_response)
+
+        # [ARC-BUG-20] Publish before building the record: this is the single place every
+        # guardrail reports its own verdict, so the metrics wrapper gets the truth for free
+        # rather than each guardrail having to remember to emit a metric.
+        _LAST_GUARDRAIL_STATUS.set(guardrail_status)
 
         slg = StandardLoggingGuardrailInformation(
             guardrail_name=self.guardrail_name,
