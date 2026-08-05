@@ -10798,7 +10798,10 @@ async def _try_provider_token_count(
     system: Optional[str] = None,
 ) -> Optional["TokenCountResponse"]:
     """Attempt provider-specific token counting. Returns result on success, None to fall through to local counting."""
-    if not provider_counter.should_use_token_counting_api(custom_llm_provider=custom_llm_provider):
+    # [ARC-BUG-40] Pass the model so the provider can decline per-model. Bedrock's CountTokens
+    # rejects whole Anthropic families, and calling it anyway spends a request to earn a 400 —
+    # a FAST 400, which is precisely what the router's cooldown counts.
+    if not provider_counter.should_use_token_counting_api(custom_llm_provider=custom_llm_provider, model=model_to_use):
         return None
     try:
         result = await provider_counter.count_tokens(

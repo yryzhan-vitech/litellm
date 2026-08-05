@@ -33,9 +33,15 @@ class BaseTokenCounter(ABC):
     def should_use_token_counting_api(
         self,
         custom_llm_provider: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> bool:
         """
         Returns True if we should the this API for token counting for the selected `custom_llm_provider`
+
+        [ARC-BUG-40] `model` is accepted so a provider can decline per-model, not just per-provider:
+        Bedrock's CountTokens API rejects entire model families, and calling it anyway spends a
+        request to earn a guaranteed 400. Optional and keyword-friendly so the six existing
+        implementations and both call sites keep working unchanged.
         """
         return False
 

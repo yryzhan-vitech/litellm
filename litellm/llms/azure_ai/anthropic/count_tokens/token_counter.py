@@ -22,7 +22,13 @@ class AzureAIAnthropicTokenCounter(BaseTokenCounter):
     def should_use_token_counting_api(
         self,
         custom_llm_provider: Optional[str] = None,
+        **kwargs,
     ) -> bool:
+        # [ARC-BUG-40] **kwargs so the widened base signature (which now passes `model`, letting
+        # Bedrock decline per-model) does not TypeError here. Measured: without it,
+        # litellm.acount_tokens silently fell through to the local tokenizer for every provider
+        # — four tests in test_count_tokens_public_api.py caught it, and the failure mode was a
+        # wrong token count rather than an exception, which is exactly the kind that ships.
         return custom_llm_provider == LlmProviders.AZURE_AI.value
 
     async def count_tokens(

@@ -8774,7 +8774,7 @@ async def acount_tokens(
         if provider_model_info is not None:
             token_counter_instance = provider_model_info.get_token_counter()
             if token_counter_instance is not None and token_counter_instance.should_use_token_counting_api(
-                custom_llm_provider
+                custom_llm_provider, model=resolved_model
             ):
                 result = await token_counter_instance.count_tokens(
                     model_to_use=resolved_model,
