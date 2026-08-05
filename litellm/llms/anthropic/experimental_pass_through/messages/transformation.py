@@ -39,6 +39,62 @@ DROP_UNSUPPORTED_ADAPTIVE_EFFORT_WARNING = (
 )
 
 
+# [ARC-BUG-48] Both restored from prod image a2e1b93d30 (fork commit be5879c8752), whose
+# footprint in this file was dropped by the de-fork while its hunks in advisor.py, handler.py
+# and guardrail_translation were carried. The call site survived; only these definitions and
+# the three lines that invoke them were cut, so a marker-grep on the file found nothing and a
+# ruff reformat made it look recently touched. Same commit also lost the server_tool_use and
+# advisor_tool_result branches in fake_stream_iterator.py — one commit, two files, both silent.
+def _resolve_proxy_model_alias_to_litellm_model(model: str) -> str:
+    """Resolve proxy model_name alias to configured litellm model string."""
+    try:
+        from litellm.proxy.proxy_server import llm_router
+    except Exception:
+        return ""
+
+    model_list = getattr(llm_router, "model_list", None) or []
+    for deployment in model_list:
+        if not isinstance(deployment, dict):
+            continue
+        if deployment.get("model_name") != model:
+            continue
+        litellm_params = deployment.get("litellm_params") or {}
+        configured_model = litellm_params.get("model")
+        if isinstance(configured_model, str):
+            return configured_model
+    return ""
+
+
+def _normalize_anthropic_advisor_tool_models(tools: List[Dict]) -> List[Dict]:
+    """
+    Normalize advisor tool model names for Anthropic native /v1/messages calls.
+
+    Anthropic expects advisor tool model values like ``claude-opus-4-6``. Proxy alias names
+    (e.g. ``claude_opus``) and provider-prefixed values (e.g. ``anthropic/claude-opus-4-6``)
+    are converted. Without this the alias reaches Anthropic verbatim and earns a 400 naming
+    the advisor model field — a failure that looks like a caller mistake and is not one.
+    """
+    normalized_tools: List[Dict] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            normalized_tools.append(tool)
+            continue
+        if tool.get("type") != ANTHROPIC_ADVISOR_TOOL_TYPE:
+            normalized_tools.append(tool)
+            continue
+
+        updated_tool = dict(tool)
+        advisor_model = updated_tool.get("model")
+        if isinstance(advisor_model, str) and advisor_model.strip():
+            resolved = _resolve_proxy_model_alias_to_litellm_model(advisor_model.strip())
+            canonical_model = resolved or advisor_model.strip()
+            if canonical_model.startswith("anthropic/"):
+                canonical_model = canonical_model.split("/", 1)[1]
+            updated_tool["model"] = canonical_model
+        normalized_tools.append(updated_tool)
+    return normalized_tools
+
+
 class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
     @property
     def custom_llm_provider(self) -> Optional[str]:
@@ -479,6 +535,15 @@ class AnthropicMessagesConfig(BaseAnthropicMessagesConfig):
         # Auto-strip advisor blocks from history if advisor tool is absent.
         # Prevents Anthropic 400: advisor_tool_result in history requires advisor tool.
         _tools = anthropic_messages_optional_request_params.get("tools") or []
+        # [ARC-BUG-48] Restored from prod image a2e1b93d30, second hunk of the same lost commit
+        # (be5879c8752) that took the fake_stream_iterator branches. The surrounding site
+        # survived the de-fork; only these three lines were cut, which is why nothing looked
+        # missing. Without them a proxy alias in advisor_tool["model"] reaches Anthropic
+        # verbatim and earns a 400 on the native /v1/messages leg.
+        if _tools:
+            normalized_tools = _normalize_anthropic_advisor_tool_models(_tools)
+            anthropic_messages_optional_request_params["tools"] = normalized_tools
+            _tools = normalized_tools
         _has_advisor = any(isinstance(t, dict) and t.get("type") == ANTHROPIC_ADVISOR_TOOL_TYPE for t in _tools)
         if not _has_advisor:
             messages = strip_advisor_blocks_from_messages(messages)  # type: ignore[assignment]

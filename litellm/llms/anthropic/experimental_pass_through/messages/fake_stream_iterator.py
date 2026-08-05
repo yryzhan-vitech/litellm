@@ -11,6 +11,7 @@ the LLM doesn't make a tool call, and we need to return a stream to the user.
 import json
 from typing import Any, Dict, List, cast
 
+from litellm._logging import verbose_logger
 from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,
 )
@@ -112,6 +113,81 @@ class FakeAnthropicMessagesStreamIterator:
                 },
             }
             chunks.append(f"event: content_block_delta\ndata: {json.dumps(content_block_delta)}\n\n".encode())
+
+        # [ARC-BUG-48] Restored from the pre-de-fork production image a2e1b93d30, where these two
+        # branches had been live since fork commit be5879c8752. The de-fork carried that commit's
+        # other hunks — interceptors/advisor.py, handler.py, guardrail_translation — and silently
+        # dropped its footprint in THIS file (+43 lines) and in messages/transformation.py
+        # (+55 lines). The commit read as "handled" while two of its thirteen files were never
+        # diffed, and a ruff reformat on the clean side made this file look recently touched.
+        #
+        # Why the loss was client-visible: the caller loop below iterates EVERY content block with
+        # enumerate and appends a content_block_stop for each index unconditionally. A block whose
+        # type has no branch here therefore emits a stop with no matching start, and its id never
+        # reaches the wire at all. A client applying the standard SSE reconstruction has nothing to
+        # attach at that index, so when it replays the turn as history the server_tool_use block
+        # comes back without a recoverable id — and Anthropic rejects it:
+        #   400 messages.N.content.M.server_tool_use.id: String should match pattern
+        #       '^srvtoolu_[a-zA-Z0-9_]+$'
+        # Observed on prd-ai 2026-08-05; it stopped the moment the advisor was switched off,
+        # because advisor.py:172 is what returns this iterator for streaming callers.
+        elif block_type == "server_tool_use":
+            content_block_start = {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": block_dict.get("id"),
+                    "name": block_dict.get("name"),
+                },
+            }
+            chunks.append(f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n".encode())
+
+        elif block_type == "advisor_tool_result":
+            content_block_start = {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "advisor_tool_result",
+                    "tool_use_id": block_dict.get("tool_use_id"),
+                    "content": {"type": "advisor_result", "text": ""},
+                },
+            }
+            chunks.append(f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n".encode())
+            advisor_content = block_dict.get("content") or {}
+            advisor_text = advisor_content.get("text", "") if isinstance(advisor_content, dict) else ""
+            if advisor_text:
+                content_block_delta = {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "advisor_result_delta", "text": advisor_text},
+                }
+                chunks.append(f"event: content_block_delta\ndata: {json.dumps(content_block_delta)}\n\n".encode())
+
+        else:
+            # [ARC-BUG-48] Fail OPEN on an unknown block type, which is the part that was missing
+            # rather than merely lost. The enumerate loop guarantees a stop for every index, so the
+            # only two possible shapes for an unhandled type are "a start we synthesised" or "a
+            # stop with no start". The first is a block a client may not fully understand; the
+            # second is a malformed stream that corrupts the caller's history. Emitting a generic
+            # start makes the next unhandled type — and Anthropic keeps adding them — degrade
+            # instead of breaking, so this exact defect cannot recur silently.
+            #
+            # Deliberately passes the block through as-is: guessing at a shape per type is what
+            # produced the ARC-BUG-44/45 family, where an allowlist rebuilt native blocks lossily.
+            content_block_start = {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block_dict,
+            }
+            chunks.append(f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n".encode())
+            verbose_logger.warning(
+                "FakeAnthropicMessagesStreamIterator: no handler for content block type %r at index %s — "
+                "emitting the block verbatim in content_block_start so the stream stays well-formed. "
+                "Add an explicit branch if this type needs deltas.",
+                block_type,
+                index,
+            )
 
         content_block_stop = {"type": "content_block_stop", "index": index}
         chunks.append(f"event: content_block_stop\ndata: {json.dumps(content_block_stop)}\n\n".encode())
