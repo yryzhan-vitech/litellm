@@ -11,9 +11,18 @@ config, in both the bare and the `us.`-prefixed form:
     us.anthropic.claude-opus-4-7 / -4-8 / -5     ValidationException: doesn't support counting tokens
     us.anthropic.claude-fable-5                  ValidationException: doesn't support counting tokens
 
-Not one of them works. Every call was guaranteed to 400, and those 400s are FAST — which is
-exactly what the router's cooldown counts. On prd-ai, 33 of 34 successful fallbacks were
-triggered by status=400 from this path, not by any provider incident.
+Not one of them works. Every call was guaranteed to 400: 82 wasted round-trips per pod per 4.5h
+and ~246 log lines, about 37% of one prod pod's volume.
+
+⚠️ An earlier version of this docstring claimed those 400s arm the router's cooldown. That is
+FALSE and was corrected by review: the CountTokens path never reaches deployment failure
+accounting (no logging_obj / failure_callback anywhere under
+litellm/llms/bedrock/count_tokens/), and _is_cooldown_required returns False for 400 regardless.
+The cooldown trigger is litellm.Timeout at status 408. This patch does not make arming
+allowed_fails safer.
+
+Callers see no change: the 400 already fell through to the local tokenizer, so every Anthropic
+count on prod comes from it today. This removes the wasted call, not a number anyone relies on.
 """
 
 import pytest

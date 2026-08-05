@@ -32,11 +32,23 @@ from litellm.types.utils import LlmProviders, TokenCountResponse
 # abandoned — inference-profile ids are rejected too, for every model. Both forms fail
 # identically, which the probe above confirms line by line.
 #
-# Why skipping matters beyond the noise: those 400s are FAST, and a fast failure is exactly what
-# the router's cooldown counts. Measured on prd-ai, 33 of 34 successful fallbacks were triggered
-# by status=400 — CountTokens, not a provider incident. With allowed_fails armed, three
-# token-count requests on one pod would cool a deployment fleet-wide for 30s. The 400s have to
-# stop being generated before a circuit breaker can safely be switched on.
+# Why skipping matters beyond the noise: 82 wasted Bedrock round-trips per pod per 4.5h, and
+# ~246 log lines — three per event (handler.py's HTTP 400, bedrock_token_counter.py, and
+# proxy_server.py's "falling back to local tokenizer"), roughly 37% of one prod pod's log volume.
+#
+# ⚠️ CORRECTION to an earlier version of this comment, which claimed these 400s arm the router's
+# cooldown and that stopping them was a precondition for setting allowed_fails: 2. Both halves are
+# FALSE, verified two ways: (a) litellm/llms/bedrock/count_tokens/ contains zero references to
+# logging_obj / failure_callback / litellm_logging — it posts through a raw async client, so it
+# never reaches deployment failure accounting at all; (b) _is_cooldown_required returns False for
+# 400 (measured: 400 -> False, 408/429/500/503 -> True). The dangerous trigger is litellm.Timeout,
+# which carries status 408. So this patch does NOT make the cooldown safer and must not be cited
+# as the safety precondition for arming it.
+#
+# Callers see no change either: proxy_server.py already logged "Provider token counting failed"
+# and returned None on the 400, falling through to the local tokenizer — measured 82/82/82 on a
+# prod pod, so every Anthropic count already comes from the local tokenizer today. This removes
+# the wasted call, not a number anyone depends on.
 #
 # Deliberately a denylist, not an allowlist: Bedrock adds CountTokens support over time, and an
 # allowlist would silently keep skipping a model the day support arrives. A denylist degrades the

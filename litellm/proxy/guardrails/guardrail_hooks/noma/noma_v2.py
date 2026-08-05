@@ -5,6 +5,7 @@
 # +-------------------------------------------------------------+
 
 import asyncio
+import contextvars
 import enum
 import json
 import math
@@ -96,8 +97,35 @@ _CONNECTION_FAILURE_ELAPSED_FRACTION: float = 0.05
 # second attempt is safe, and a stale pooled connection is cured by the fresh one the first
 # failure already forced. If a newly-established connection also fails this fast, reuse is not
 # the problem. NOMA_CONNECTION_RETRY_MAX and NOMA_CONNECTION_RETRY_CEILING_SECONDS live in
-# constants.py and read the environment, so the retry can be switched off at runtime
-# (NOMA_CONNECTION_RETRY_MAX=0) without an image rebuild.
+# constants.py and read the environment; NOMA_CONNECTION_RETRY_MAX=0 restores the pre-fix
+# behaviour whole — retry and classifier both.
+#
+# ⚠️ NOT hot-reloadable, and an earlier version of this comment overstated it. get_env_int runs at
+# module import and this module binds the VALUE, not the module, so changing the variable needs a
+# deployment env edit plus a rolling restart of every proxy pod — the same blast radius as an
+# image revert, minus only the rebuild. It is also not plumbed today: neither dev-ai nor prd-ai
+# declares any NOMA_* env on the proxy deployment (Noma credentials arrive via envFrom secretRef),
+# so a first use means authoring an untested overlay change under pressure. Plumb it at its
+# default BEFORE it is needed.
+
+# [ARC-BUG-47] Per-request storage for the last scan attempt's own duration, read by the
+# ARC-BUG-43 classifier in apply_guardrail so a retried fast failure is not relabelled
+# DEADLINE EXCEEDED.
+#
+# 🔴 A ContextVar, NOT an instance attribute, and the difference is a real bug that a review
+# caught. initialize_guardrail_v2 registers ONE NomaV2Guardrail per config as a global callback,
+# so every concurrent request shares the instance. The write (in _call_noma_scan) and the read (in
+# apply_guardrail's except arm) are separated by an await boundary plus real work — masker
+# traversal, OTEL attributes, audit-record build — so a concurrent fast scan landing in that
+# window overwrote the value. Reproduced: a genuine 1.05s expiry against a 1.0s budget classified
+# on 0.006s and reported timed_out=False, which is precisely the inversion this mechanism exists
+# to prevent. With block_failures=False the exception is swallowed, so the misclassification is
+# invisible by construction.
+#
+# asyncio propagates context per task, so each request gets its own value with no cleanup needed.
+_LAST_SCAN_ATTEMPT_ELAPSED: contextvars.ContextVar = contextvars.ContextVar(
+    "noma_last_scan_attempt_elapsed", default=None
+)
 
 _DEFAULT_API_BASE = "https://api.noma.security/"
 _AIDR_SCAN_ENDPOINT = "/litellm/guardrail"
@@ -357,7 +385,11 @@ class NomaV2Guardrail(CustomGuardrail):
                 deadline_budget if attempt == 0 else min(deadline_budget, NOMA_CONNECTION_RETRY_CEILING_SECONDS)
             )
             attempt_started = time.monotonic()
-            self._last_scan_attempt_elapsed = None
+            # Reset per attempt. Gated on the retry being enabled so NOMA_CONNECTION_RETRY_MAX=0
+            # restores the pre-ARC-BUG-47 classifier exactly, not just the retry — a review found
+            # the kill switch left this half active.
+            if NOMA_CONNECTION_RETRY_MAX > 0:
+                _LAST_SCAN_ATTEMPT_ELAPSED.set(None)
             try:
                 response = await asyncio.wait_for(
                     self.async_handler.post(
@@ -378,7 +410,8 @@ class NomaV2Guardrail(CustomGuardrail):
                 # ARC-BUG-43 exists to make trustworthy. Reproduced at scan_timeout=6.0:
                 # attempt 1 at 0.25s plus attempt 2 at 5.2s reported "DEADLINE EXCEEDED after
                 # 5.452s" although neither attempt came near the budget.
-                self._last_scan_attempt_elapsed = attempt_elapsed
+                if NOMA_CONNECTION_RETRY_MAX > 0:
+                    _LAST_SCAN_ATTEMPT_ELAPSED.set(attempt_elapsed)
                 looks_like_connection_failure = (
                     isinstance(e, _TIMEOUT_EXCEPTIONS)
                     and attempt_elapsed < self.scan_timeout * _CONNECTION_FAILURE_ELAPSED_FRACTION
@@ -558,7 +591,7 @@ class NomaV2Guardrail(CustomGuardrail):
             # `elapsed` still reports total wall-clock in the log and audit record, which is
             # what a caller waited; only the expiry test uses the per-attempt figure, because
             # "did this scan burn its budget" is a question about one attempt.
-            attempt_elapsed_for_classification = getattr(self, "_last_scan_attempt_elapsed", None)
+            attempt_elapsed_for_classification = _LAST_SCAN_ATTEMPT_ELAPSED.get()
             classify_on = (
                 attempt_elapsed_for_classification if attempt_elapsed_for_classification is not None else elapsed
             )

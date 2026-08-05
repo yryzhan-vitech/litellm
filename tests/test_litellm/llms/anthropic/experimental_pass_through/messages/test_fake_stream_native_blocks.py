@@ -196,6 +196,49 @@ class TestUnknownBlockTypesFailOpen:
         start = next(d for n, d in events if n == "content_block_start")
         assert start["content_block"] == block, "the block must survive byte-for-byte"
 
+    @pytest.mark.parametrize(
+        "hostile,label",
+        [
+            ({"type": "web_search_tool_result", "page_age": __import__("datetime").datetime(2026, 8, 5)}, "datetime"),
+            ({"type": "mcp_tool_result", "data": b"raw"}, "bytes"),
+            ({"type": "mcp_tool_use", "score": float("nan")}, "NaN"),
+            ({"type": "mcp_tool_use", "score": float("inf")}, "inf"),
+            ({"type": "container_upload", "obj": object()}, "arbitrary object"),
+        ],
+    )
+    def test_an_unserialisable_block_does_not_kill_the_stream(self, hostile, label):
+        """🔴 The first version of this guard failed CLOSED, which is worse than the bug it fixes.
+
+        _create_streaming_chunks runs in __init__, so an unguarded json.dumps raise escapes the
+        CONSTRUCTOR: the caller never receives an iterator and the client gets a 500 with ZERO SSE
+        bytes. That is a third shape the original reasoning did not enumerate — not "a start" or
+        "a bare stop" but "no stream at all".
+
+        Reachable on the ALREADY-LIVE websearch path, independent of the advisor:
+        websearch_interception injects web_search_tool_result blocks whose page_age comes from
+        getattr off a model declaring extra="allow", so a provider transform assigning a datetime
+        bypasses validation. Measured as TypeError from __init__ before the guard.
+
+        NaN and inf are the nastier pair: json.dumps ACCEPTS them and emits the bare literals,
+        which are not valid JSON — Go encoding/json, serde_json and JSON.parse all reject them.
+        That one fails client-side mid-stream, after bytes are committed.
+        """
+        events = _events([hostile])
+        starts, stops = _starts_and_stops(events)
+        assert starts == stops == {0}, f"{label}: the stream must stay balanced"
+        raw = json.dumps(events)
+        assert "NaN" not in raw and "Infinity" not in raw, f"{label}: invalid JSON literal reached the wire"
+        start = next(d for n, d in events if n == "content_block_start")
+        assert start["content_block"]["type"] == hostile["type"], f"{label}: the type must survive"
+
+    def test_a_degraded_block_says_so_in_the_log(self, caplog):
+        """An operator must be able to tell "passed through" from "we could not serialise it"."""
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            _events([{"type": "mcp_tool_result", "data": b"raw"}])
+        assert "not JSON-serialisable" in caplog.text
+
     def test_an_unknown_type_is_logged_so_it_gets_a_branch_later(self, caplog):
         import logging
 

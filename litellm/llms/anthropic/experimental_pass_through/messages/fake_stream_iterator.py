@@ -165,28 +165,56 @@ class FakeAnthropicMessagesStreamIterator:
                 chunks.append(f"event: content_block_delta\ndata: {json.dumps(content_block_delta)}\n\n".encode())
 
         else:
-            # [ARC-BUG-48] Fail OPEN on an unknown block type, which is the part that was missing
-            # rather than merely lost. The enumerate loop guarantees a stop for every index, so the
-            # only two possible shapes for an unhandled type are "a start we synthesised" or "a
-            # stop with no start". The first is a block a client may not fully understand; the
-            # second is a malformed stream that corrupts the caller's history. Emitting a generic
-            # start makes the next unhandled type — and Anthropic keeps adding them — degrade
-            # instead of breaking, so this exact defect cannot recur silently.
+            # [ARC-BUG-48] Fail OPEN on an unknown block type — the part that was missing rather
+            # than merely lost. The enumerate loop guarantees a stop for every index, so an
+            # unhandled type otherwise emits a stop with no start, which corrupts the caller's
+            # history. Emitting a generic start makes the next unhandled type — and Anthropic
+            # keeps adding them — degrade instead of breaking.
             #
-            # Deliberately passes the block through as-is: guessing at a shape per type is what
-            # produced the ARC-BUG-44/45 family, where an allowlist rebuilt native blocks lossily.
-            content_block_start = {
-                "type": "content_block_start",
-                "index": index,
-                "content_block": block_dict,
-            }
-            chunks.append(f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n".encode())
+            # Passed through unreshaped on purpose: guessing at a per-type shape is what produced
+            # the ARC-BUG-44/45 family, where an allowlist rebuilt native blocks lossily.
+            #
+            # 🔴 The serialisation is guarded, and the first version of this was NOT — which made
+            # it fail CLOSED, worse than the bug it fixes. `_create_streaming_chunks` runs in
+            # __init__, so a raise here escapes the CONSTRUCTOR: the caller never receives an
+            # iterator and the client gets a 500 with zero SSE bytes. That is a third shape the
+            # original reasoning did not enumerate — not "a start" or "a bare stop" but "no stream
+            # at all".
+            #
+            # Reachable on the ALREADY-LIVE websearch path, independent of the advisor:
+            # websearch_interception injects `web_search_tool_result` blocks whose `page_age` is
+            # read via getattr off a model declaring extra="allow", so a provider transform
+            # assigning a datetime bypasses validation and reaches json.dumps. Measured:
+            # TypeError from __init__ for datetime and for bytes. This iterator has six call
+            # sites, so "the advisor is off" covers only one of them.
+            #
+            # allow_nan=False because json.dumps otherwise emits the bare literal NaN, which is
+            # not valid JSON — Go encoding/json, serde_json and JSON.parse all reject it. That
+            # one fails CLIENT-side mid-stream, after bytes are committed, which is the least
+            # recoverable position of all.
+            #
+            # The fallback keeps the type only. It loses detail, but the goal here is a BALANCED
+            # stream, and a start naming the type satisfies that while never betting the whole
+            # request on caller-shaped data.
+            try:
+                start_payload = json.dumps(
+                    {"type": "content_block_start", "index": index, "content_block": block_dict},
+                    allow_nan=False,
+                )
+                degraded = False
+            except (TypeError, ValueError):
+                start_payload = json.dumps(
+                    {"type": "content_block_start", "index": index, "content_block": {"type": block_type}}
+                )
+                degraded = True
+            chunks.append(f"event: content_block_start\ndata: {start_payload}\n\n".encode())
             verbose_logger.warning(
                 "FakeAnthropicMessagesStreamIterator: no handler for content block type %r at index %s — "
-                "emitting the block verbatim in content_block_start so the stream stays well-formed. "
+                "emitting %s in content_block_start so the stream stays well-formed. "
                 "Add an explicit branch if this type needs deltas.",
                 block_type,
                 index,
+                "the type only (the block was not JSON-serialisable)" if degraded else "the block verbatim",
             )
 
         content_block_stop = {"type": "content_block_stop", "index": index}

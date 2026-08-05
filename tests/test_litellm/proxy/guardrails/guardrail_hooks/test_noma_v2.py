@@ -177,14 +177,10 @@ class TestNomaV2Configuration:
             application_id="dynamic-app",
         )
 
-        payload["request_data"]["metadata"]["headers"][
-            "x-noma-application-id"
-        ] = "mutated-value"
+        payload["request_data"]["metadata"]["headers"]["x-noma-application-id"] = "mutated-value"
         payload["request_data"]["messages"][0]["content"] = "changed-content"
 
-        assert (
-            request_data["metadata"]["headers"]["x-noma-application-id"] == "header-app"
-        )
+        assert request_data["metadata"]["headers"]["x-noma-application-id"] == "header-app"
         assert request_data["messages"][0]["content"] == "hello"
 
     def test_build_scan_payload_snapshots_model_call_details(self, noma_v2_guardrail):
@@ -224,9 +220,7 @@ class TestNomaV2Configuration:
 
         assert payload["request_data"]["litellm_logging_obj"] is None
 
-    def test_build_scan_payload_survives_unpicklable_request_data(
-        self, noma_v2_guardrail
-    ):
+    def test_build_scan_payload_survives_unpicklable_request_data(self, noma_v2_guardrail):
         """Regression test for NOM-8044: post_call / during_call / during_mcp_call
         used to 500 because request_data contained uvloop.Loop and similar
         C-extension objects whose __reduce__ raises, which crashed deepcopy."""
@@ -255,16 +249,12 @@ class TestNomaV2Configuration:
 
         assert isinstance(payload["request_data"], dict)
         assert payload["request_data"]["event_loop"] == "<fake-uvloop-loop>"
-        assert payload["request_data"]["messages"] == [
-            {"role": "user", "content": "hello"}
-        ]
+        assert payload["request_data"]["messages"] == [{"role": "user", "content": "hello"}]
 
         # Original request_data must not have been mutated by the copy.
         assert request_data["event_loop"] is unpicklable
 
-    def test_build_scan_payload_passes_model_call_details_as_is(
-        self, noma_v2_guardrail
-    ):
+    def test_build_scan_payload_passes_model_call_details_as_is(self, noma_v2_guardrail):
         class _LoggingObj:
             def __init__(self) -> None:
                 self.model_call_details = {
@@ -301,9 +291,7 @@ class TestNomaV2Configuration:
         assert request_data["litellm_logging_obj"] == "<Logging object>"
 
     @pytest.mark.asyncio
-    async def test_call_noma_scan_sanitizes_response_model_dump_object(
-        self, noma_v2_guardrail
-    ):
+    async def test_call_noma_scan_sanitizes_response_model_dump_object(self, noma_v2_guardrail):
         import json
 
         class _FakeModelResponse:
@@ -331,9 +319,7 @@ class TestNomaV2Configuration:
         json.dumps(sent_payload)
         assert sent_payload["request_data"]["response"]["id"] == "resp-1"
 
-    def test_sanitize_payload_for_transport_falls_back_to_safe_dumps(
-        self, noma_v2_guardrail
-    ):
+    def test_sanitize_payload_for_transport_falls_back_to_safe_dumps(self, noma_v2_guardrail):
         with patch(
             "litellm.proxy.guardrails.guardrail_hooks.noma.noma_v2.json.dumps",
             side_effect=TypeError("cannot serialize"),
@@ -342,16 +328,12 @@ class TestNomaV2Configuration:
                 "litellm.proxy.guardrails.guardrail_hooks.noma.noma_v2.safe_dumps",
                 return_value='{"fallback": true}',
             ) as mock_safe_dumps:
-                sanitized = noma_v2_guardrail._sanitize_payload_for_transport(
-                    {"inputs": {"texts": ["hello"]}}
-                )
+                sanitized = noma_v2_guardrail._sanitize_payload_for_transport({"inputs": {"texts": ["hello"]}})
 
         mock_safe_dumps.assert_called_once()
         assert sanitized == {"fallback": True}
 
-    def test_sanitize_payload_for_transport_logs_warning_when_payload_becomes_empty(
-        self, noma_v2_guardrail
-    ):
+    def test_sanitize_payload_for_transport_logs_warning_when_payload_becomes_empty(self, noma_v2_guardrail):
         with patch(
             "litellm.proxy.guardrails.guardrail_hooks.noma.noma_v2.safe_json_loads",
             return_value={},
@@ -359,18 +341,14 @@ class TestNomaV2Configuration:
             with patch(
                 "litellm.proxy.guardrails.guardrail_hooks.noma.noma_v2.verbose_proxy_logger.warning"
             ) as mock_warning:
-                sanitized = noma_v2_guardrail._sanitize_payload_for_transport(
-                    {"inputs": {"texts": ["hello"]}}
-                )
+                sanitized = noma_v2_guardrail._sanitize_payload_for_transport({"inputs": {"texts": ["hello"]}})
 
         assert sanitized == {}
         mock_warning.assert_called_once_with(
             "Noma v2 guardrail: payload serialization failed, falling back to empty payload"
         )
 
-    def test_sanitize_payload_for_transport_logs_warning_on_non_dict_output(
-        self, noma_v2_guardrail
-    ):
+    def test_sanitize_payload_for_transport_logs_warning_on_non_dict_output(self, noma_v2_guardrail):
         with patch(
             "litellm.proxy.guardrails.guardrail_hooks.noma.noma_v2.safe_json_loads",
             return_value=["not-a-dict"],
@@ -378,9 +356,7 @@ class TestNomaV2Configuration:
             with patch(
                 "litellm.proxy.guardrails.guardrail_hooks.noma.noma_v2.verbose_proxy_logger.warning"
             ) as mock_warning:
-                sanitized = noma_v2_guardrail._sanitize_payload_for_transport(
-                    {"inputs": {"texts": ["hello"]}}
-                )
+                sanitized = noma_v2_guardrail._sanitize_payload_for_transport({"inputs": {"texts": ["hello"]}})
 
         assert sanitized == {}
         mock_warning.assert_called_once_with(
@@ -393,9 +369,7 @@ class TestNomaV2Configuration:
 
 
 class TestNomaV2ActionBehavior:
-    def test_resolve_action_from_response_raises_on_unknown_action(
-        self, noma_v2_guardrail
-    ):
+    def test_resolve_action_from_response_raises_on_unknown_action(self, noma_v2_guardrail):
         with pytest.raises(ValueError, match="missing valid action"):
             noma_v2_guardrail._resolve_action_from_response({"action": "INVALID"})
 
@@ -420,9 +394,7 @@ class TestNomaV2ActionBehavior:
         assert result == inputs
 
     @pytest.mark.asyncio
-    async def test_native_action_guardrail_intervened_updates_supported_fields(
-        self, noma_v2_guardrail
-    ):
+    async def test_native_action_guardrail_intervened_updates_supported_fields(self, noma_v2_guardrail):
         inputs = {
             "texts": ["Name: Jane"],
             "images": ["https://old.example/image.png"],
@@ -465,9 +437,7 @@ class TestNomaV2ActionBehavior:
 
         assert result["texts"] == ["Name: *******"]
         assert result["images"] == ["https://new.example/image.png"]
-        assert result["tools"] == [
-            {"type": "function", "function": {"name": "new_tool"}}
-        ]
+        assert result["tools"] == [{"type": "function", "function": {"name": "new_tool"}}]
         assert result["tool_calls"] == [
             {
                 "id": "call_1",
@@ -498,9 +468,7 @@ class TestNomaV2ActionBehavior:
         assert exc_info.value.detail["details"]["blocked_reason"] == "blocked by policy"
 
     @pytest.mark.asyncio
-    async def test_intervened_without_modifications_returns_original_inputs(
-        self, noma_v2_guardrail
-    ):
+    async def test_intervened_without_modifications_returns_original_inputs(self, noma_v2_guardrail):
         inputs = {"texts": ["Name: Jane"]}
         with patch.object(
             noma_v2_guardrail,
@@ -597,9 +565,7 @@ class TestNomaV2ApplicationIdResolution:
         assert payload["application_id"] == "dynamic-app"
 
     @pytest.mark.asyncio
-    async def test_apply_guardrail_uses_configured_application_id(
-        self, noma_v2_guardrail
-    ):
+    async def test_apply_guardrail_uses_configured_application_id(self, noma_v2_guardrail):
         call_mock = AsyncMock(return_value={"action": "NONE"})
         with patch.object(
             noma_v2_guardrail,
@@ -617,9 +583,7 @@ class TestNomaV2ApplicationIdResolution:
         assert payload["application_id"] == "test-app"
 
     @pytest.mark.asyncio
-    async def test_apply_guardrail_falls_back_to_key_alias_from_litellm_metadata(
-        self, noma_v2_guardrail
-    ):
+    async def test_apply_guardrail_falls_back_to_key_alias_from_litellm_metadata(self, noma_v2_guardrail):
         """When no explicit application_id is set, fall back to user_api_key_alias
         so that each API key gets its own application entry in the Noma dashboard."""
         noma_v2_guardrail.application_id = None
@@ -644,9 +608,7 @@ class TestNomaV2ApplicationIdResolution:
         assert payload["application_id"] == "test-key-alias"
 
     @pytest.mark.asyncio
-    async def test_apply_guardrail_falls_back_to_key_alias_from_metadata(
-        self, noma_v2_guardrail
-    ):
+    async def test_apply_guardrail_falls_back_to_key_alias_from_metadata(self, noma_v2_guardrail):
         """user_api_key_alias in metadata (set by proxy_server.py) is also resolved."""
         noma_v2_guardrail.application_id = None
         call_mock = AsyncMock(return_value={"action": "NONE"})
@@ -669,9 +631,7 @@ class TestNomaV2ApplicationIdResolution:
         assert payload["application_id"] == "test-service-key"
 
     @pytest.mark.asyncio
-    async def test_apply_guardrail_configured_application_id_takes_precedence_over_key_alias(
-        self, noma_v2_guardrail
-    ):
+    async def test_apply_guardrail_configured_application_id_takes_precedence_over_key_alias(self, noma_v2_guardrail):
         """Explicit application_id (config/env) wins over key_alias fallback."""
         call_mock = AsyncMock(return_value={"action": "NONE"})
         request_data = {
@@ -750,9 +710,7 @@ def _text_stream(chunk_count):
 
 
 async def _drain_through_unified_guardrail(guardrail, chunk_count, scanned_texts=None):
-    assembled = ModelResponse(
-        choices=[Choices(index=0, message=Message(role="assistant", content="assembled"))]
-    )
+    assembled = ModelResponse(choices=[Choices(index=0, message=Message(role="assistant", content="assembled"))])
     scan_mock = AsyncMock(return_value={"action": "NONE"})
     if scanned_texts is not None:
         original_apply = guardrail.apply_guardrail
@@ -902,9 +860,7 @@ class TestNomaV2StreamingKnobs:
         guardrail = _streaming_guardrail(streaming_end_of_stream_only=True)
         scanned_texts = []
 
-        scan_mock = await _drain_through_unified_guardrail(
-            guardrail, chunk_count=6, scanned_texts=scanned_texts
-        )
+        scan_mock = await _drain_through_unified_guardrail(guardrail, chunk_count=6, scanned_texts=scanned_texts)
 
         assert scan_mock.call_count == 1
         assert scanned_texts == ["assembled"]
@@ -923,9 +879,7 @@ class TestNomaV2StreamingKnobs:
         guardrail = _streaming_guardrail(streaming_sampling_rate=2)
         scanned_texts = []
 
-        scan_mock = await _drain_through_unified_guardrail(
-            guardrail, chunk_count=5, scanned_texts=scanned_texts
-        )
+        scan_mock = await _drain_through_unified_guardrail(guardrail, chunk_count=5, scanned_texts=scanned_texts)
 
         assert scan_mock.call_count == 3
         assert scanned_texts == [
@@ -986,8 +940,16 @@ class TestNomaV2ScanTimeout:
         "bad",
         [0, -1, True, "abc", "inf", "nan", "1e400", 0.05, 600, "600"],
         ids=[
-            "zero", "negative", "bool", "non-numeric", "inf", "nan", "overflow-to-inf",
-            "below-floor", "above-ceiling", "above-ceiling-str",
+            "zero",
+            "negative",
+            "bool",
+            "non-numeric",
+            "inf",
+            "nan",
+            "overflow-to-inf",
+            "below-floor",
+            "above-ceiling",
+            "above-ceiling-str",
         ],
     )
     def test_scan_timeout_rejects_non_positive_non_finite_and_sub_floor(self, bad):
@@ -1021,9 +983,7 @@ class TestNomaV2ScanTimeout:
         passed = mock_post.await_args.kwargs["timeout"]
         assert isinstance(passed, httpx.Timeout)
         assert passed.read == noma_v2_guardrail.scan_timeout
-        assert passed.connect == min(
-            HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS, noma_v2_guardrail.scan_timeout
-        )
+        assert passed.connect == min(HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS, noma_v2_guardrail.scan_timeout)
 
     @pytest.mark.asyncio
     async def test_timeout_does_not_block_request_and_is_audited(self):
@@ -1120,9 +1080,7 @@ class TestNomaV2ScanTimeout:
             use_v2=True,
             timeout=2.0,
         )
-        callback = initialize_guardrail_v2(
-            litellm_params=params, guardrail={"guardrail_name": "noma-during-call"}
-        )
+        callback = initialize_guardrail_v2(litellm_params=params, guardrail={"guardrail_name": "noma-during-call"})
         assert callback.scan_timeout == 2.0
 
     def test_scan_timeout_wins_over_generic_timeout(self):
@@ -1135,9 +1093,7 @@ class TestNomaV2ScanTimeout:
             timeout=2.0,
             scan_timeout=7.0,
         )
-        callback = initialize_guardrail_v2(
-            litellm_params=params, guardrail={"guardrail_name": "noma-during-call"}
-        )
+        callback = initialize_guardrail_v2(litellm_params=params, guardrail={"guardrail_name": "noma-during-call"})
         assert callback.scan_timeout == 7.0
 
     def test_default_is_well_under_the_shared_client_budget(self):
@@ -1211,9 +1167,7 @@ class TestNomaV2ScanTimeout:
                 inputs={"texts": ["hello"]}, input_type="request", request_data=request_data
             )
 
-        response = request_data["metadata"]["standard_logging_guardrail_information"][0][
-            "guardrail_response"
-        ]
+        response = request_data["metadata"]["standard_logging_guardrail_information"][0]["guardrail_response"]
         assert response["timed_out"] is False
         assert response["error"] == "ValueError"
 
@@ -1310,18 +1264,14 @@ class TestNomaV2ScanTimeout:
             event_hook="pre_call",
         )
         request_data = {"metadata": {}}
-        instant = litellm.Timeout(
-            message="Connection timed out. time taken=0.001 seconds", model="m", llm_provider="p"
-        )
+        instant = litellm.Timeout(message="Connection timed out. time taken=0.001 seconds", model="m", llm_provider="p")
 
         with patch.object(guardrail.async_handler, "post", AsyncMock(side_effect=instant)):
             await guardrail.apply_guardrail(
                 inputs={"texts": ["hello"]}, input_type="request", request_data=request_data
             )
 
-        response = request_data["metadata"]["standard_logging_guardrail_information"][0][
-            "guardrail_response"
-        ]
+        response = request_data["metadata"]["standard_logging_guardrail_information"][0]["guardrail_response"]
         assert response["timed_out"] is False, "an instant failure is not a deadline expiry"
         assert response["elapsed_seconds"] < 1.0
         assert response["scan_timeout_seconds"] == 10.0
@@ -1347,9 +1297,7 @@ class TestNomaV2ScanTimeout:
 
         with patch.object(guardrail.async_handler, "post", _hang):
             task = asyncio.create_task(
-                guardrail.apply_guardrail(
-                    inputs={"texts": ["hello"]}, input_type="request", request_data=request_data
-                )
+                guardrail.apply_guardrail(inputs={"texts": ["hello"]}, input_type="request", request_data=request_data)
             )
             await asyncio.sleep(0.05)
             task.cancel()
@@ -1374,9 +1322,7 @@ class TestNomaV2ScanTimeout:
             timeout=5.0,
         )
         with pytest.raises(ValueError, match="scan_timeout"):
-            initialize_guardrail_v2(
-                litellm_params=params, guardrail={"guardrail_name": "noma-during-call"}
-            )
+            initialize_guardrail_v2(litellm_params=params, guardrail={"guardrail_name": "noma-during-call"})
 
     def test_generic_timeout_of_600_does_not_restore_the_600s_budget(self):
         """`timeout: 600` is the exact budget this deadline exists to remove. Superseded by
@@ -1390,14 +1336,11 @@ class TestNomaV2ScanTimeout:
             use_v2=True,
             timeout=600.0,
         )
-        callback = initialize_guardrail_v2(
-            litellm_params=params, guardrail={"guardrail_name": "noma-pre-call"}
-        )
+        callback = initialize_guardrail_v2(litellm_params=params, guardrail={"guardrail_name": "noma-pre-call"})
         from litellm.constants import NOMA_MAX_SCAN_TIMEOUT_SECONDS
 
         assert callback.scan_timeout == NOMA_MAX_SCAN_TIMEOUT_SECONDS
         assert callback.scan_timeout < 600.0
-
 
     @pytest.mark.parametrize(
         "generic_timeout,expected",
@@ -1418,9 +1361,7 @@ class TestNomaV2ScanTimeout:
             use_v2=True,
             timeout=generic_timeout,
         )
-        callback = initialize_guardrail_v2(
-            litellm_params=params, guardrail={"guardrail_name": "noma-pre-call"}
-        )
+        callback = initialize_guardrail_v2(litellm_params=params, guardrail={"guardrail_name": "noma-pre-call"})
         assert callback.scan_timeout == expected
 
     def test_non_timeout_failure_log_does_not_carry_the_exception_text(self, caplog):
@@ -1442,13 +1383,9 @@ class TestNomaV2ScanTimeout:
         request_data = {"metadata": {}}
 
         with caplog.at_level(logging.ERROR):
-            with patch.object(
-                guardrail.async_handler, "post", AsyncMock(side_effect=ValueError(secret))
-            ):
+            with patch.object(guardrail.async_handler, "post", AsyncMock(side_effect=ValueError(secret))):
                 asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-                    guardrail.apply_guardrail(
-                        inputs={"texts": ["hi"]}, input_type="request", request_data=request_data
-                    )
+                    guardrail.apply_guardrail(inputs={"texts": ["hi"]}, input_type="request", request_data=request_data)
                 )
 
         assert secret not in caplog.text, "PHI must not reach the container log"
@@ -1805,4 +1742,144 @@ class TestNomaV2ConnectionFailureRetry:
         # litellm.Timeout stringifies with the URL and a future exception type could carry more.
         assert "Timeout on reading data from socket" not in caplog.text, (
             "the exception's own message must not reach the container log"
+        )
+
+
+class TestConcurrencySafetyOfTheClassifier:
+    """[ARC-BUG-47 review] The per-attempt classifier must be per-REQUEST, not per-instance.
+
+    `initialize_guardrail_v2` registers ONE NomaV2Guardrail per config as a global callback, so
+    every concurrent request shares the instance. The first version of this fix parked the last
+    attempt's elapsed time on `self`, which two independent reviews flagged as a cross-request
+    leak.
+
+    ⚠️ Honest about what these tests do and do not prove. Measured while writing them: the
+    end-to-end scenario below passes on the instance-state version TOO, because the write and the
+    read are separated only by a synchronous `raise` — no await sits in that window, so a
+    concurrent task cannot interleave between them in practice. The leak is real but narrower than
+    "the classifier is randomly wrong at concurrency": it needs a caller that awaits between
+    `_call_noma_scan` raising and `apply_guardrail` classifying, which this code path does not do
+    today and a refactor easily could.
+
+    So the first test asserts the OUTCOME stays correct under concurrency (a regression guard that
+    would catch a future refactor introducing that await), and the second asserts the MECHANISM
+    directly — that the state lives in a ContextVar and not on the instance, which is the property
+    that makes the whole class of bug impossible rather than merely unlikely. Asserting only the
+    outcome would have let the instance-state version pass, as it did.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_concurrent_fast_failure_does_not_steal_the_slow_scans_classification(self):
+        guardrail = NomaV2Guardrail(
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            monitor_mode=True,
+            block_failures=False,
+            guardrail_name="noma-pre-call",
+            event_hook="pre_call",
+            default_on=True,
+        )
+        guardrail.scan_timeout = 1.0
+
+        async def genuine_expiry(*args, **kwargs):
+            await asyncio.sleep(1.05)
+            raise httpx.ReadTimeout("real expiry")
+
+        async def fast_connection_break(*args, **kwargs):
+            raise httpx.ReadTimeout("socket")
+
+        async def drive(side_effect, request_data):
+            with patch.object(guardrail.async_handler, "post", AsyncMock(side_effect=side_effect)):
+                await guardrail.apply_guardrail(
+                    inputs={"texts": ["x"]},
+                    request_data=request_data,
+                    input_type="request",
+                    logging_obj=None,
+                )
+
+        rd_slow: dict = {"metadata": {}}
+        rd_fast: dict = {"metadata": {}}
+
+        slow = asyncio.create_task(drive(genuine_expiry, rd_slow))
+        await asyncio.sleep(0.4)  # land the fast failure inside the slow scan's window
+        await drive(fast_connection_break, rd_fast)
+        await slow
+
+        slow_response = rd_slow["metadata"]["standard_logging_guardrail_information"][0]["guardrail_response"]
+        assert slow_response["timed_out"] is True, (
+            "a genuine deadline expiry was reclassified because a concurrent fast failure "
+            "overwrote the shared classifier state"
+        )
+
+        fast_response = rd_fast["metadata"]["standard_logging_guardrail_information"][0]["guardrail_response"]
+        assert fast_response["timed_out"] is False, "the fast failure must still be a fast failure"
+
+    @pytest.mark.asyncio
+    async def test_the_classifier_state_is_context_local_not_instance_state(self):
+        """Assert the MECHANISM, because asserting the outcome alone is not enough.
+
+        This is the test that actually fails if the state moves back onto `self` — the outcome
+        test above does not, measured. Two properties are checked: the value lands in the
+        ContextVar, and it does NOT land on the shared instance where a future refactor could
+        leak it across requests.
+        """
+        guardrail = NomaV2Guardrail(
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            monitor_mode=True,
+            block_failures=False,
+            guardrail_name="noma-pre-call",
+            event_hook="pre_call",
+            default_on=True,
+        )
+        nv2._LAST_SCAN_ATTEMPT_ELAPSED.set(None)
+        post = AsyncMock(side_effect=httpx.ReadTimeout("socket"))
+        with patch.object(guardrail.async_handler, "post", post):
+            with pytest.raises(httpx.ReadTimeout):
+                await guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+
+        assert nv2._LAST_SCAN_ATTEMPT_ELAPSED.get() is not None, (
+            "the attempt's elapsed time must be recorded in the ContextVar"
+        )
+        assert not hasattr(guardrail, "_last_scan_attempt_elapsed"), (
+            "the elapsed time must NOT be parked on the shared guardrail instance — "
+            "initialize_guardrail_v2 registers one instance per config for the whole pod"
+        )
+
+        # A task started from a COPIED context does not see this request's value — that is the
+        # isolation property, and it is what asyncio gives each request handler.
+        import contextvars
+
+        fresh = contextvars.Context()
+        assert fresh.run(nv2._LAST_SCAN_ATTEMPT_ELAPSED.get) is None, (
+            "a fresh context must not inherit another request's attempt time"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_kill_switch_restores_the_classifier_too_not_just_the_retry(self):
+        """[ARC-BUG-47 review] NOMA_CONNECTION_RETRY_MAX=0 must restore the PRE-fix behaviour whole.
+
+        The first version stopped the retry but kept writing the per-attempt value, so an operator
+        pulling the kill switch to escape a retry problem kept the classifier change — and its
+        race. Both are now gated on the same switch.
+        """
+        guardrail = NomaV2Guardrail(
+            api_key="test-api-key",
+            api_base="https://api.test.noma.security/",
+            monitor_mode=True,
+            block_failures=False,
+            guardrail_name="noma-pre-call",
+            event_hook="pre_call",
+            default_on=True,
+        )
+        nv2._LAST_SCAN_ATTEMPT_ELAPSED.set(None)
+        post = AsyncMock(side_effect=httpx.ReadTimeout("socket"))
+        with patch.object(nv2, "NOMA_CONNECTION_RETRY_MAX", 0):
+            with patch.object(guardrail.async_handler, "post", post):
+                with pytest.raises(httpx.ReadTimeout):
+                    await guardrail._call_noma_scan(payload={"inputs": {"texts": []}})
+
+        assert post.await_count == 1, "kill switch must disable the retry"
+        assert nv2._LAST_SCAN_ATTEMPT_ELAPSED.get() is None, (
+            "with the retry disabled, the classifier state must not be written either"
         )
