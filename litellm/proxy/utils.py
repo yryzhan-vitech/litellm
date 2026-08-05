@@ -1138,6 +1138,14 @@ class ProxyLogging:
         guardrail_start_time = time.perf_counter()
         status = "success"
         error_type = None
+        # [ARC-BUG-20] Clear before the call: pre_call, during_call and post_call all run inside ONE
+        # request context, and a bare `await` propagates a callee's ContextVar write back to the
+        # caller, so without this a clean hook inherits an earlier hook's failure.
+        # Imported locally to match the rest of this module — a top-level import of
+        # custom_guardrail here is a cyclic import.
+        from litellm.integrations.custom_guardrail import _LAST_GUARDRAIL_STATUS
+
+        _LAST_GUARDRAIL_STATUS.set(None)
 
         try:
             # Check if load balancing should be used
@@ -1184,11 +1192,14 @@ class ProxyLogging:
                 guardrail_name or getattr(callback, "guardrail_name", callback.__class__.__name__) or "unknown"
             )
 
+            # [ARC-BUG-20] Same resolution the during_call/post_call wrapper does — see
+            # _resolve_guardrail_status. This emitter was missed by the first version of the fix.
+            resolved_status, resolved_error = ProxyLogging._resolve_guardrail_status(status, error_type)
             self._emit_guardrail_metrics(
                 guardrail_name=metrics_guardrail_name,
                 latency_seconds=latency_seconds,
-                status=status,
-                error_type=error_type,
+                status=resolved_status,
+                error_type=resolved_error,
                 hook_type="pre_call",
             )
 
@@ -1591,6 +1602,36 @@ class ProxyLogging:
         return data
 
     @staticmethod
+    def _resolve_guardrail_status(status: str, error_type: Optional[str]) -> Tuple[str, Optional[str]]:
+        """[ARC-BUG-20] Prefer the status a guardrail COMPUTED over one inferred from an exception.
+
+        Both metric emitters derive `status` from what escapes the coroutine, so neither can see a
+        failure that was caught and handled. `block_failures: false` makes a guardrail catch its own
+        failure and return the inputs unchanged — nothing escapes, and a scan that never reached the
+        vendor is counted as one that passed.
+
+        🔴 This lives in a shared helper because the first version of the fix patched only ONE of the
+        two emitters. `_run_guardrail_with_metrics` serves during_call and post_call; `pre_call` has
+        its own try/finally with a second `_emit_guardrail_metrics` call, and it was left reporting
+        `success` on failed scans. Found on prd-ai, where a pod that had logged `FAILED FAST` still
+        showed zero non-success series — and pre_call is where most of those failures land. The unit
+        tests missed it because every one of them called the wrapper directly rather than going
+        through the hook.
+
+        Only consulted when nothing escaped: an escaping exception is the more specific signal, and
+        `error_type` must keep the exception class so an operator can tell a vendor outage from a bug
+        in our own code.
+        """
+        from litellm.integrations.custom_guardrail import _LAST_GUARDRAIL_STATUS
+
+        if status != "success":
+            return status, error_type
+        self_reported = _LAST_GUARDRAIL_STATUS.get()
+        if self_reported is not None and self_reported != "success":
+            return self_reported, error_type or self_reported
+        return status, error_type
+
+    @staticmethod
     def _emit_guardrail_metrics(
         guardrail_name: str,
         latency_seconds: float,
@@ -1651,20 +1692,8 @@ class ProxyLogging:
             _enrich_http_exception_with_guardrail_context(e, callback)
             raise
         finally:
-            # [ARC-BUG-20] Prefer the status the guardrail COMPUTED over the one inferred here.
-            # Only consulted when nothing escaped, because an escaping exception is the more
-            # specific signal — a guardrail that both reported a failure AND raised is an
-            # `error`/`intervened`/`cancelled` case, and those arms already set `status`.
-            #
-            # This closes the fail-open blind spot: `block_failures: false` makes a guardrail catch
-            # its own failure and return the inputs, so nothing escapes and this wrapper had no way
-            # to know the content went unscanned. Nine such events on dev-ai sat behind a
-            # 100%-success dashboard.
-            if status == "success":
-                self_reported = _LAST_GUARDRAIL_STATUS.get()
-                if self_reported is not None and self_reported != "success":
-                    status = self_reported
-                    error_type = error_type or self_reported
+            # [ARC-BUG-20] Shared with the pre_call emitter — see _resolve_guardrail_status.
+            status, error_type = ProxyLogging._resolve_guardrail_status(status, error_type)
             ProxyLogging._emit_guardrail_metrics(
                 guardrail_name=guardrail_name,
                 latency_seconds=time.perf_counter() - start_time,

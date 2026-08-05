@@ -2337,3 +2337,120 @@ async def test_the_real_noma_guardrail_reports_an_unscanned_response():
 
     assert out == inputs, "block_failures=False must keep failing open"
     assert emitted[-1]["status"] != "success", "an unscanned response must not read as a success"
+
+
+@pytest.mark.asyncio
+async def test_pre_call_hook_also_reports_a_fail_open_scan_honestly():
+    """The second emitter, and the reason this test goes through the HOOK rather than the wrapper.
+
+    🔴 The first version of the ARC-BUG-20 fix patched only `_run_guardrail_with_metrics`, which
+    serves during_call and post_call. `pre_call` has its OWN try/finally with a second
+    `_emit_guardrail_metrics` call (`_process_guardrail_callback`), and it kept reporting
+    `status="success"` on failed scans.
+
+    Found on prd-ai, not by a test: a pod that had logged `FAILED FAST` still showed zero non-success
+    series. Every unit test written for the first fix called the wrapper directly, so none of them
+    ever entered this code path — a function was tested where a path should have been. pre_call is
+    also where most Noma connection failures land, so the half that was missed was the important one.
+    """
+    from litellm.integrations.custom_guardrail import _LAST_GUARDRAIL_STATUS
+    from litellm.types.guardrails import GuardrailEventHooks
+
+    emitted: list = []
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=DualCache())
+
+    class _FailOpenGuardrail:
+        guardrail_name = "noma-pre-call"
+        event_hook = "pre_call"
+
+        def should_run_guardrail(self, data, event_type):
+            return True
+
+        def mark_pre_call_hook_ran(self, data):
+            return None
+
+        async def async_pre_call_hook(self, **kwargs):
+            # What apply_guardrail does under block_failures=False: report, then return cleanly.
+            _LAST_GUARDRAIL_STATUS.set("guardrail_failed_to_respond")
+            return None
+
+    async def _fake_execute(**kwargs):
+        return await _FailOpenGuardrail().async_pre_call_hook()
+
+    with patch.object(ProxyLogging, "_emit_guardrail_metrics", staticmethod(lambda **kw: emitted.append(kw))):
+        with patch.object(ProxyLogging, "_execute_guardrail_hook", staticmethod(_fake_execute)):
+            await proxy_logging_obj._process_guardrail_callback(
+                callback=_FailOpenGuardrail(),  # type: ignore[arg-type]
+                data={"metadata": {}},
+                user_api_key_dict=None,
+                call_type="acompletion",
+                event_type=GuardrailEventHooks.pre_call,
+            )
+
+    assert emitted, "the pre_call finally block must emit a metric"
+    assert emitted[-1]["hook_type"] == "pre_call"
+    assert emitted[-1]["status"] == "guardrail_failed_to_respond", (
+        "pre_call must not report a fail-open failure as a success"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_call_hook_leaves_a_clean_scan_alone():
+    """The fast path must not be relabelled — otherwise every clean pre_call scan reads as a failure."""
+    from litellm.types.guardrails import GuardrailEventHooks
+
+    emitted: list = []
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=DualCache())
+
+    class _CleanGuardrail:
+        guardrail_name = "noma-pre-call"
+        event_hook = "pre_call"
+
+        def should_run_guardrail(self, data, event_type):
+            return True
+
+        def mark_pre_call_hook_ran(self, data):
+            return None
+
+    async def _fake_execute(**kwargs):
+        return None
+
+    with patch.object(ProxyLogging, "_emit_guardrail_metrics", staticmethod(lambda **kw: emitted.append(kw))):
+        with patch.object(ProxyLogging, "_execute_guardrail_hook", staticmethod(_fake_execute)):
+            await proxy_logging_obj._process_guardrail_callback(
+                callback=_CleanGuardrail(),  # type: ignore[arg-type]
+                data={"metadata": {}},
+                user_api_key_dict=None,
+                call_type="acompletion",
+                event_type=GuardrailEventHooks.pre_call,
+            )
+
+    assert emitted[-1]["status"] == "success"
+    assert emitted[-1]["error_type"] is None
+
+
+def test_both_metric_emitters_resolve_the_status_through_one_helper():
+    """A structural test, because the defect was a missed call site rather than wrong logic.
+
+    Two emitters exist and the first fix patched one. Asserting that BOTH route through
+    `_resolve_guardrail_status` is what stops a third emitter from being added without it — a
+    behavioural test on today's two paths would not catch that.
+    """
+    import inspect
+
+    pre_call_src = inspect.getsource(ProxyLogging._process_guardrail_callback)
+    wrapper_src = inspect.getsource(ProxyLogging._run_guardrail_with_metrics)
+
+    assert "_resolve_guardrail_status" in pre_call_src, "the pre_call emitter must resolve the status"
+    assert "_resolve_guardrail_status" in wrapper_src, "the during/post_call wrapper must resolve it too"
+
+    # And every emitter call site in the module must be preceded by a resolution in its own function.
+    import litellm.proxy.utils as proxy_utils
+
+    module_src = inspect.getsource(proxy_utils)
+    emitter_calls = module_src.count("_emit_guardrail_metrics(\n")
+    resolutions = module_src.count("_resolve_guardrail_status(")
+    assert resolutions >= emitter_calls, (
+        f"{emitter_calls} emitter call sites but only {resolutions} status resolutions — "
+        "a new emitter was added without resolving the self-reported status"
+    )
