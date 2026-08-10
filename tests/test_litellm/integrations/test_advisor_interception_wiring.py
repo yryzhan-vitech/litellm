@@ -110,3 +110,68 @@ def test_both_predicates_agree_on_the_dated_tool_type():
     not_advisor = {"type": "web_search_20250305", "name": "web_search"}
     assert chat_predicate(not_advisor) is False
     assert messages_predicate(not_advisor) is False
+
+
+@pytest.mark.asyncio
+async def test_enabling_it_does_not_break_the_messages_path_advisor():
+    """🔴 The two advisor mechanisms must not cross-contaminate.
+
+    `_execute_pre_request_hooks` (the /v1/messages entry) iterates EVERY registered
+    callback unconditionally, and `async_pre_request_hook` carries no `call_type` to
+    gate on. So enabling this subsystem rewrote `advisor_20260301` into an OpenAI
+    function tool *before* `resolve_advisor_gate_provider`/`can_handle()` ran —
+    `is_advisor_tool()` then saw `type == "function"`, declined, and the dedicated
+    /v1/messages orchestration was silently skipped. That is the "advisor does not
+    fire" symptom, caused by the fix meant to help it.
+
+    Measured end to end before the gate landed; this is the regression guard.
+    """
+    from litellm.llms.anthropic.experimental_pass_through.messages.handler import (
+        _execute_pre_request_hooks,
+    )
+    from litellm.types.llms.anthropic import is_advisor_tool
+
+    initialize_callbacks_on_proxy(
+        value=["advisor_interception"],
+        premium_user=True,
+        config_file_path="",
+        litellm_settings={"advisor_interception_params": {"default_advisor_model": "claude-opus-4-8"}},
+    )
+
+    advisor_tool = {"type": "advisor_20260301", "name": "advisor", "model": "claude-opus-4-8"}
+    returned = await _execute_pre_request_hooks(
+        model="claude-sonnet-5",
+        messages=[{"role": "user", "content": "review my plan"}],
+        tools=[dict(advisor_tool)],
+        stream=False,
+        custom_llm_provider="bedrock",
+    )
+
+    tools = (returned or {}).get("tools")
+    assert tools and tools[0].get("type") == "advisor_20260301", (
+        f"the advisor tool was rewritten on the /v1/messages path: {tools}"
+    )
+    assert is_advisor_tool(tools[0]), "can_handle() would decline and skip orchestration"
+
+
+@pytest.mark.asyncio
+async def test_the_chat_completions_conversion_still_happens():
+    """The gate must not disable the subsystem's actual job.
+
+    Negative control for the test above: on its own path the advisor tool SHOULD be
+    converted to an OpenAI function tool, or the interception loop has nothing to catch.
+    """
+    from litellm.integrations.advisor_interception import AdvisorInterceptionLogger
+
+    logger = AdvisorInterceptionLogger(default_advisor_model="claude-opus-4-8")
+    kwargs = {
+        "tools": [{"type": "advisor_20260301", "name": "advisor", "model": "claude-opus-4-8"}],
+        "litellm_params": {"custom_llm_provider": "bedrock"},
+    }
+
+    returned = await logger.async_pre_request_hook("claude-sonnet-5", [{"role": "user", "content": "x"}], kwargs)
+
+    tools = (returned or kwargs).get("tools")
+    assert tools and tools[0].get("type") == "function", (
+        f"chat-completions conversion was lost, so interception cannot fire: {tools}"
+    )

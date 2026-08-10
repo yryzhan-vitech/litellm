@@ -42,6 +42,23 @@ def _request(*tools):
     }
 
 
+def _guardrail(side_effect):
+    """A guardrail double that behaves like a real one.
+
+    ⚠️ Must NOT be a bare ``MagicMock``. ``effective_skip_system_message_for_guardrail``
+    and its tool twin read ``getattr(guardrail, "skip_*_in_guardrail", None)``, and a bare
+    mock answers every attribute with a truthy auto-attribute — so the per-guardrail
+    override fires and the handler silently runs with ``skip_system`` AND ``skip_tool``
+    enabled. A real ``CustomGuardrail`` yields ``False`` for both (measured). Pinning the
+    two flags explicitly is what makes these tests exercise the path production takes.
+    """
+    guardrail = MagicMock()
+    guardrail.skip_system_message_in_guardrail = False
+    guardrail.skip_tool_message_in_guardrail = False
+    guardrail.apply_guardrail = AsyncMock(side_effect=side_effect)
+    return guardrail
+
+
 def _noop_guardrail():
     """A text-moderation guardrail: echoes `inputs` back untouched.
 
@@ -49,9 +66,17 @@ def _noop_guardrail():
     text and returns the same structure, so any tool loss is the seam's fault, not
     the guardrail's.
     """
-    guardrail = MagicMock()
-    guardrail.apply_guardrail = AsyncMock(side_effect=lambda inputs, **_: inputs)
-    return guardrail
+    return _guardrail(lambda inputs, **_: inputs)
+
+
+def _tool_names(tools):
+    """Identities as a LIST, so a duplicate is visible.
+
+    ⚠️ Never assert with ``_tool_ids`` alone. It is a set, so a tool appearing twice
+    compares equal to a tool appearing once — which is exactly the failure mode this
+    fix can produce. Every test that checks membership must also check count.
+    """
+    return [t.get("name") or t.get("type") for t in (tools or [])]
 
 
 def _tool_ids(tools):
@@ -85,8 +110,9 @@ async def test_a_noop_guardrail_does_not_drop_the_diverted_web_search_tool():
         litellm_logging_obj=MagicMock(),
     )
 
-    assert _tool_ids(returned["tools"]) == {"web_search", "get_weather"}, (
-        "the guardrail never saw web_search, so it must not be able to remove it"
+    assert _tool_names(returned["tools"]) == ["get_weather", "web_search"], (
+        "the guardrail never saw web_search, so it must not be able to remove it — and "
+        "the diverted tool must come LAST, after the reviewed ones"
     )
 
 
@@ -116,8 +142,6 @@ async def test_a_guardrail_that_edits_a_tool_still_wins_on_the_tools_it_saw():
     """
     data = _request(WEB_SEARCH, REGULAR)
 
-    guardrail = MagicMock()
-
     async def _mask(inputs, **_):
         edited = []
         for tool in inputs.get("tools") or []:
@@ -126,13 +150,11 @@ async def test_a_guardrail_that_edits_a_tool_still_wins_on_the_tools_it_saw():
             edited.append({**tool, "function": fn})
         return {**inputs, "tools": edited}
 
-    guardrail.apply_guardrail = AsyncMock(side_effect=_mask)
-
     returned = await AnthropicMessagesHandler().process_input_messages(
-        data=data, guardrail_to_apply=guardrail, litellm_logging_obj=MagicMock()
+        data=data, guardrail_to_apply=_guardrail(_mask), litellm_logging_obj=MagicMock()
     )
 
-    assert _tool_ids(returned["tools"]) == {"web_search", "get_weather"}
+    assert _tool_names(returned["tools"]) == ["get_weather", "web_search"]
     masked = next(t for t in returned["tools"] if t.get("name") == "get_weather")
     assert masked.get("description") == "[MASKED]", "the guardrail's edit was lost"
 
@@ -170,7 +192,9 @@ async def test_no_hosted_tool_type_is_dropped(tool):
         data=data, guardrail_to_apply=_noop_guardrail(), litellm_logging_obj=MagicMock()
     )
 
-    assert _tool_ids(returned["tools"]) == {tool["name"], "get_weather"}
+    assert sorted(_tool_names(returned["tools"])) == sorted([tool["name"], "get_weather"]), (
+        "every tool must survive EXACTLY once — a set comparison would hide a duplicate"
+    )
 
 
 @pytest.mark.asyncio
@@ -210,9 +234,7 @@ def _blocking_guardrail():
     The fix must not resurrect a tool the guardrail deliberately dropped — that is the
     difference between "preserve what was never reviewed" and "override the reviewer".
     """
-    guardrail = MagicMock()
-    guardrail.apply_guardrail = AsyncMock(side_effect=lambda inputs, **_: {**inputs, "tools": []})
-    return guardrail
+    return _guardrail(lambda inputs, **_: {**inputs, "tools": []})
 
 
 LONG_NAME = "a" * 70  # over the 64-char cap, so the translation rewrites it

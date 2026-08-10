@@ -100,11 +100,47 @@ class AdvisorInterceptionLogger(CustomLogger):
         """
         Convert advisor tools into provider-compatible form before request.
 
-        Skips conversion for anthropic_messages call type because the Messages
-        API path has its own AdvisorOrchestrationHandler interceptor.
+        Skips conversion on the /v1/messages path, which has its own
+        ``AdvisorOrchestrationHandler`` interceptor and needs the raw
+        ``advisor_20260301`` tool definition to recognise the request at all.
+
+        🔴 [ARC-BUG-52] The skip is IMPLEMENTED here, not merely documented. The
+        docstring claimed it for the ``anthropic_messages`` call type, but this hook
+        receives no ``call_type`` (the ``CustomLogger`` signature has none) and had no
+        check, while ``_execute_pre_request_hooks``
+        (``anthropic/experimental_pass_through/messages/handler.py``) iterates **every**
+        registered callback unconditionally, for every endpoint. So enabling this
+        subsystem rewrote ``advisor_20260301`` into an OpenAI function tool BEFORE
+        ``resolve_advisor_gate_provider``/``can_handle()`` ran; ``is_advisor_tool()`` then
+        saw ``type == "function"``, declined, and the dedicated /v1/messages
+        orchestration was silently skipped — the exact "advisor does not fire" symptom
+        this branch is meant to fix. Measured end to end with the callback enabled.
+
+        The two mechanisms are gated apart by ENDPOINT, which this hook can detect from
+        the Anthropic-native request shape its caller passes.
         """
+        if self._is_anthropic_messages_request(kwargs):
+            return None
         custom_llm_provider = kwargs.get("litellm_params", {}).get("custom_llm_provider", "")
         return self._convert_tools_for_provider(kwargs=kwargs, custom_llm_provider=custom_llm_provider)
+
+    @staticmethod
+    def _is_anthropic_messages_request(kwargs: dict) -> bool:
+        """Is this the /v1/messages path, which owns its own advisor interception?
+
+        ``_execute_pre_request_hooks`` is only reached from the Anthropic Messages
+        handler, and it builds its ``request_kwargs`` with a fixed shape: a top-level
+        ``tools`` and ``stream``, and ``custom_llm_provider`` NESTED inside
+        ``litellm_params`` (never at the top level). The chat-completions path does not
+        route through that function at all, so that shape is the endpoint marker.
+
+        ⚠️ Keyed on the SHAPE, not on a call type, because this hook's signature carries
+        no ``call_type`` to key on. If upstream ever adds one, prefer it and delete this.
+        """
+        if "stream" not in kwargs or "tools" not in kwargs:
+            return False
+        litellm_params = kwargs.get("litellm_params")
+        return isinstance(litellm_params, dict) and "custom_llm_provider" in litellm_params
 
     async def async_pre_call_deployment_hook(self, kwargs: dict[str, Any], call_type: Any | None) -> dict | None:  # noqa: ANN401  # ported verbatim from fork main / prod image a2e1b93d30; upstream signature
         """
