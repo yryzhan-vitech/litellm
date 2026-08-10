@@ -272,6 +272,23 @@ def initialize_callbacks_on_proxy(
                     callback_specific_params=callback_specific_params,
                 )
                 imported_list.append(websearch_interception_obj)
+            elif isinstance(callback, str) and callback == "advisor_interception":
+                # [ARC-BUG-52] Restores the chat-completions advisor path the de-fork dropped.
+                # The subsystem shipped on the prod image a2e1b93d30 and on fork main, but its
+                # five files were absent from this branch entirely — so `callbacks:
+                # ["advisor_interception"]` raised on startup instead of registering. Opt-in by
+                # config, exactly like its websearch sibling above: no callback, no behaviour
+                # change. The /v1/messages advisor path is a DIFFERENT mechanism
+                # (interceptors/advisor.py) and is untouched by this.
+                from litellm.integrations.advisor_interception.handler import (
+                    AdvisorInterceptionLogger,
+                )
+
+                advisor_interception_obj = AdvisorInterceptionLogger.initialize_from_proxy_config(
+                    litellm_settings=litellm_settings,
+                    callback_specific_params=callback_specific_params,
+                )
+                imported_list.append(advisor_interception_obj)
             elif isinstance(callback, str) and callback == "datadog_cost_management":
                 from litellm.integrations.datadog.datadog_cost_management import (
                     DatadogCostManagementLogger,
