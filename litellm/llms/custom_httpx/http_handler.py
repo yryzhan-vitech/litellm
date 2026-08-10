@@ -597,6 +597,96 @@ class AsyncHTTPHandler:
         )
         return response
 
+    # [ARC-BUG-47 site C] Below this fraction of the budget, a timeout-typed failure is
+    # read as a broken pooled connection rather than an expired deadline.
+    #
+    # Measured on prd-ai: 74 such failures in ~25 minutes with elapsed p50 0.036 s and max
+    # 0.093 s against a 10 s budget — i.e. under 1 % of it. 0.05 leaves the 5–100 % band as
+    # neither-retried-nor-misread, deliberately: a failure that spent a twentieth of its
+    # budget was doing real work against a real peer, and retrying that doubles latency on
+    # a peer that is merely slow. Mirrors the same constant in noma_v2 (site A) rather than
+    # picking a second number, so the two sites cannot drift apart.
+    _BROKEN_CONNECTION_ELAPSED_FRACTION = 0.05
+
+    @staticmethod
+    def _timeout_budget_seconds(timeout: Union[float, httpx.Timeout, None]) -> Union[float, None]:
+        """The read budget in seconds, or None when it cannot be established.
+
+        `httpx.Timeout` carries four independent budgets; `read` is the one a
+        SocketTimeoutError is measured against. Returning None makes the caller decline to
+        retry — an unknown budget must not be treated as a large one.
+        """
+        if isinstance(timeout, httpx.Timeout):
+            budget = timeout.read
+        elif isinstance(timeout, (int, float)):
+            budget = float(timeout)
+        else:
+            return None
+        if budget is None or budget <= 0:
+            return None
+        return float(budget)
+
+    @classmethod
+    def _remaining_timeout(
+        cls, timeout: Union[float, httpx.Timeout, None], elapsed: float
+    ) -> Union[float, httpx.Timeout]:
+        """The budget a retry inherits — never a fresh full one.
+
+        [ARC-BUG-47] A retry that resets the deadline lets one dead connection double the
+        worst-case latency the caller budgeted for. A floor of 1 s is applied because a
+        near-zero budget guarantees the retry fails, which is strictly worse than not
+        retrying: it spends a connection and still returns the timeout.
+        """
+        budget = cls._timeout_budget_seconds(timeout)
+        if budget is None:
+            return timeout if timeout is not None else 1.0
+        remaining = max(budget - elapsed, 1.0)
+        if isinstance(timeout, httpx.Timeout):
+            return httpx.Timeout(
+                timeout=remaining,
+                connect=timeout.connect,
+                write=timeout.write,
+                pool=timeout.pool,
+            )
+        return remaining
+
+    @classmethod
+    def _is_broken_pooled_connection(
+        cls,
+        exc: httpx.TimeoutException,
+        stream: bool,
+        elapsed: float,
+        timeout: Union[float, httpx.Timeout, None],
+    ) -> bool:
+        """Is this a closed keep-alive connection masquerading as a timeout?
+
+        [ARC-BUG-47 site C] All three conditions must hold; each excludes a case where a
+        retry would be wrong. See the call site in ``post`` for why the two obvious
+        alternative fixes (reclassifying the mapped exception, or widening the
+        RemoteProtocolError arm) are worse than this gate.
+        """
+        if stream:
+            # Bytes may already be on their way to the caller; a retry would duplicate a
+            # partial response. This is also what keeps site B out of scope.
+            return False
+
+        cause = exc.__cause__
+        if cause is None:
+            return False
+        try:
+            import aiohttp
+        except ImportError:  # pragma: no cover - aiohttp is a hard dependency of the transport
+            return False
+        if not isinstance(cause, aiohttp.SocketTimeoutError):
+            # ServerTimeoutError and asyncio.TimeoutError are GENUINE expiries. Retrying
+            # them doubles the wait a caller already decided was too long.
+            return False
+
+        budget = cls._timeout_budget_seconds(timeout)
+        if budget is None:
+            return False
+        return elapsed < budget * cls._BROKEN_CONNECTION_ELAPSED_FRACTION
+
     @track_llm_api_timing()
     async def post(
         self,
@@ -651,6 +741,69 @@ class AsyncHTTPHandler:
         except httpx.TimeoutException as e:
             end_time = time.time()
             time_delta = round(end_time - start_time, 3)
+
+            # [ARC-BUG-47 site C] A DEAD POOLED CONNECTION IS NOT A DEADLINE EXPIRY.
+            #
+            # aiohttp raises SocketTimeoutError when a keep-alive connection the peer has
+            # already closed breaks WHILE READING — not only when a read budget expires —
+            # and the transport maps that to httpx.ReadTimeout
+            # (aiohttp_transport.py:25). So a connection recycled by an intermediary
+            # arrives here as a "timeout" in single-digit milliseconds against a
+            # multi-second budget, and the request never reached the peer at all.
+            #
+            # Retried ONCE on a fresh connection, under three conditions, each of which
+            # excludes a case where a retry would be wrong:
+            #
+            #   1. `isinstance(e.__cause__, aiohttp.SocketTimeoutError)` — the ONLY
+            #      signature that means "the connection broke", as opposed to
+            #      ServerTimeoutError / asyncio.TimeoutError, which are genuine expiries.
+            #      `map_aiohttp_exceptions` raises `from exc`, so the cause survives;
+            #      verified by execution, and asserted in the tests.
+            #   2. `not stream` — with streaming, bytes may already be on their way to the
+            #      caller, so a retry would duplicate a partial response.
+            #   3. `time_delta < budget * _BROKEN_CONNECTION_ELAPSED_FRACTION` — a failure
+            #      that consumed a real share of its budget was doing real work against a
+            #      real peer; retrying it doubles latency on a peer that is merely slow.
+            #
+            # ⚠️ WHY NOT the two obvious alternatives, both of which are worse:
+            #   * Reclassifying the exception at aiohttp_transport.py:25 flips 408 -> 500
+            #     for EVERY consumer and silently disables the isinstance gate that
+            #     site A (noma_v2) already depends on.
+            #   * Widening the `:636` arm above is an IDEMPOTENCY BREAK. That arm catches
+            #     RemoteProtocolError / ConnectError, where the request may never have been
+            #     delivered. A ReadTimeout means it WAS delivered — so a blanket retry
+            #     there can double a non-idempotent POST. This gate's condition (1) is
+            #     what makes the retry safe: a broken pooled connection means the peer
+            #     never received it.
+            #
+            # ⚠️ The remaining budget is inherited, not reset: a retry must not grant the
+            # request a second full deadline, or one dead connection doubles the worst-case
+            # latency the caller budgeted for.
+            if self._is_broken_pooled_connection(exc=e, stream=stream, elapsed=time_delta, timeout=timeout):
+                remaining = self._remaining_timeout(timeout=timeout, elapsed=time_delta)
+                verbose_logger.warning(
+                    "[ARC-BUG-47] Retrying POST on a fresh connection: SocketTimeoutError after "
+                    "%.3fs against budget=%s, i.e. a closed pooled connection rather than an "
+                    "expired deadline. url=%s remaining_budget=%s",
+                    time_delta,
+                    timeout,
+                    url,
+                    remaining,
+                )
+                new_client = self.create_client(timeout=remaining, event_hooks=self.event_hooks)
+                try:
+                    return await self.single_connection_post_request(
+                        url=url,
+                        client=new_client,
+                        data=data,
+                        json=json,
+                        params=params,
+                        headers=headers,
+                        stream=stream,
+                    )
+                finally:
+                    await new_client.aclose()
+
             headers = {}
             error_response = getattr(e, "response", None)
             if error_response is not None:
