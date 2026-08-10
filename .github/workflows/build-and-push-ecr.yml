@@ -101,10 +101,24 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64  # v2.1.6
 
-      # The Dockerfile pulls from cgr.dev/chainguard/wolfi-base. Chainguard's
-      # public registry accepts anonymous pulls for the `latest` tag but
-      # rate-limits aggressively; use the org pull token for reliable builds.
+      # The Dockerfile pulls its build and runtime base from
+      # cgr.dev/chainguard/wolfi-base, pinned BY DIGEST. Chainguard's public registry
+      # serves anonymous pulls but rate-limits them, so the org pull token is a
+      # reliability measure, not an access requirement.
+      #
+      # continue-on-error because the token is not load-bearing and its failure must not
+      # block a build. Measured 2026-08-10 after this step returned
+      # `cgr.dev/v2/: denied: FORBIDDEN` and failed the run before `docker build` even
+      # started: an anonymous bearer token from cgr.dev/token reads the pinned digest's
+      # manifest with HTTP 200. So on a bad or expired token the build now falls through
+      # to an anonymous pull instead of failing outright.
+      #
+      # ⚠️ This does NOT remove the cgr.dev dependency — the `FROM` lines still resolve
+      # there. It only stops a credential problem from being a build outage. If pulls
+      # start failing anonymously too (rate limit), fix the token; the step's outcome is
+      # visible in the run summary rather than silent.
       - name: Login to Chainguard registry
+        continue-on-error: true
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
         with:
           registry: cgr.dev
