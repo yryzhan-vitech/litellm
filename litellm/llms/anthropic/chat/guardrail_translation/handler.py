@@ -13,7 +13,7 @@ Pattern Overview:
 """
 
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 from litellm._logging import verbose_proxy_logger
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig
@@ -259,13 +259,101 @@ class AnthropicMessagesHandler(BaseTranslation):
 
     def _translate_to_openai(self, data: dict) -> ChatCompletionRequest:
         """Translate Anthropic request to OpenAI chat completion format."""
+        chat_completion_compatible_request, _ = self._translate_to_openai_with_tool_names(data)
+        return chat_completion_compatible_request
+
+    @staticmethod
+    def _translate_to_openai_with_tool_names(
+        data: dict,
+    ) -> tuple[ChatCompletionRequest, Mapping[str, str]]:
+        """As ``_translate_to_openai``, but also returns ``{truncated: original}``.
+
+        [ARC-BUG-51] Discarding this mapping was itself a defect.
+        ``translate_anthropic_tools_to_openai`` rewrites any tool name longer than 64
+        characters to ``<55-char prefix>_<8-char hash>``, so the translated tool answers
+        to a name the caller never sent. Anything comparing the two sides by name needs
+        this to undo the rewrite.
+        """
         (
             chat_completion_compatible_request,
-            _tool_name_mapping,
+            tool_name_mapping,
         ) = LiteLLMAnthropicMessagesAdapter().translate_anthropic_to_openai(
             anthropic_message_request=cast(AnthropicMessagesRequest, data.copy())
         )
-        return chat_completion_compatible_request
+        return chat_completion_compatible_request, dict(tool_name_mapping or {})
+
+    @staticmethod
+    def _tool_identity(tool: object, tool_name_mapping: Mapping[str, str]) -> str | None:
+        """The identity a tool keeps on both sides of the OpenAI translation.
+
+        A regular tool arrives as ``{"name": ...}`` and comes back wrapped as
+        ``{"function": {"name": ...}}``; a hosted tool the adapter keeps native still
+        answers to its own ``name``, falling back to ``type`` for the shapes that carry
+        no name at all.
+
+        ⚠️ ``name`` before ``type``: Anthropic's own shape for a caller-defined tool is
+        ``{"type": "custom", "name": ...}``, so keying on ``type`` collapses every such
+        tool to the single identity ``"custom"``.
+
+        ⚠️ A translated name is resolved back through *tool_name_mapping* FIRST. Names
+        over 64 characters are rewritten by the translation, so without the reverse
+        lookup the two sides can never match, the tool is misread as diverted, and it is
+        re-attached — duplicating it on the approve path and RESURRECTING it after a
+        guardrail had explicitly removed it.
+
+        Returns ``None`` only for a tool with no identifiable name or type. Callers must
+        treat that as "cannot be matched", never as "matched nothing".
+
+        Takes ``object`` rather than a tool type: both sides of this comparison are
+        untyped JSON off the wire, and narrowing happens by the ``isinstance`` below.
+        """
+        if not isinstance(tool, dict):
+            return None
+        function = tool.get("function")
+        if isinstance(function, dict) and function.get("name"):
+            translated = str(function["name"])
+            return tool_name_mapping.get(translated, translated)
+        return str(tool.get("name") or tool.get("type") or "") or None
+
+    @classmethod
+    def _diverted_tools(
+        cls,
+        request_tools: Sequence[object],
+        tools_to_check: Sequence[ChatCompletionToolParam],
+        tool_name_mapping: Mapping[str, str],
+    ) -> tuple[object, ...]:
+        """Caller tools that the OpenAI translation did not carry into ``tools``.
+
+        [ARC-BUG-51] Derived by DIFFERENCE against what the translation actually
+        produced, rather than by restating which types get diverted. A hard-coded
+        list would silently stop covering a type the day the adapter diverts a new
+        one — the same drift that made ARC-BUG-44 and -45 two separate bugs on one
+        seam. The translation is the authority on what it kept; anything it dropped
+        is by definition unreviewable and must be preserved verbatim.
+
+        ⚠️ Nativeness and divertedness are ORTHOGONAL — do not filter on
+        ``_is_anthropic_native_tool`` here. ``web_search`` is BOTH native and diverted:
+        the writeback loop's native branch only round-trips tools the guardrail
+        returned, and a diverted tool was never in that list to begin with. Skipping
+        native tools here therefore collected nothing and left the drop in place.
+
+        ⚠️ A tool with NO identity is not diverted either. ``kept`` can never contain
+        ``None``, so treating an unidentifiable tool as "not in kept" re-attached it
+        unconditionally — duplicating it, and resurrecting it even after a guardrail had
+        removed it. Such a tool is left to the writeback loop, the only path that can
+        honour what the guardrail decided about it.
+        """
+        kept = frozenset(
+            identity
+            for identity in (cls._tool_identity(tool, tool_name_mapping) for tool in tools_to_check or ())
+            if identity
+        )
+        return tuple(
+            tool
+            for tool in request_tools or ()
+            for identity in [cls._tool_identity(tool, tool_name_mapping)]
+            if identity is not None and identity not in kept
+        )
 
     def get_structured_messages(self, data: dict) -> Optional[List[AllMessageValues]]:
         """
@@ -299,7 +387,7 @@ class AnthropicMessagesHandler(BaseTranslation):
         skip_system = effective_skip_system_message_for_guardrail(guardrail_to_apply)
         skip_tool = effective_skip_tool_message_for_guardrail(guardrail_to_apply)
 
-        chat_completion_compatible_request = self._translate_to_openai(data)
+        chat_completion_compatible_request, tool_name_mapping = self._translate_to_openai_with_tool_names(data)
 
         structured_messages = cast(
             List[AllMessageValues],
@@ -314,6 +402,20 @@ class AnthropicMessagesHandler(BaseTranslation):
         images_to_check: List[str] = []
         tools_to_check: List[ChatCompletionToolParam] = chat_completion_compatible_request.get("tools", [])
         task_mappings: List[Tuple[int, Optional[int]]] = []
+
+        # [ARC-BUG-51] Tools the OpenAI translation DIVERTS never reach the guardrail, so
+        # they must not be sourced from its reply. `_translate_to_openai` moves Anthropic
+        # hosted tools that have no OpenAI tool-shape out of `tools` and into a parameter
+        # instead — `web_search` becomes `web_search_options` — so `tools_to_check` is a
+        # strict subset of what the caller sent. Rebuilding `data["tools"]` from the
+        # guardrail's reply therefore DELETED them from the outbound request, silently:
+        # two web_search tools in, one out. ARC-BUG-45 closed the symmetric half of this
+        # seam (re-mapping a native tool a second time) and left this half open with a note.
+        #
+        # Keep the diverted originals aside and re-attach them after the writeback. They
+        # are unreviewed by construction, which is not a new gap: they were unreviewed
+        # before this fix too — the difference is that they now survive.
+        diverted_tools = self._diverted_tools(data.get("tools") or (), tools_to_check, tool_name_mapping)
 
         # Step 1: Extract all text content and images
         for msg_idx, message in enumerate(messages):
@@ -390,6 +492,9 @@ class AnthropicMessagesHandler(BaseTranslation):
                     if converted_tool is not None:
                         anthropic_tools.append(converted_tool)
                     # Note: MCP servers are handled separately in the main transformation
+                # [ARC-BUG-51] Re-attach the tools the translation diverted (see above).
+                # Appended last so a guardrail edit to a reviewed tool still wins.
+                anthropic_tools.extend(diverted_tools)
                 data["tools"] = anthropic_tools
 
             guardrailed_structured_messages = guardrailed_inputs.get("structured_messages")

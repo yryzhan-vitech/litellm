@@ -3607,24 +3607,18 @@ def test_advisor_prefix_does_not_over_match():
     assert result[0]["type"] == "function", "a lookalike type must still convert normally"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "PRE-EXISTING and NOT fixed by ARC-BUG-45. Measured: the loss is upstream of the "
-        "code this patch touches. `_translate_to_openai` partitions web_search out of "
-        "`tools` into `web_search_options` BEFORE `translate_anthropic_tools_to_openai` is "
-        'called, so the tool never reaches `inputs["tools"]` and the guardrail writeback '
-        "has nothing to put back. Skipping the reverse re-map cannot help. Kept as a "
-        "failing test so the gap is visible and cannot be mistaken for covered."
-    ),
-    strict=True,
-)
 @pytest.mark.asyncio
 async def test_hosted_tools_are_not_dropped_by_the_guardrail_writeback():
     """A hosted tool must not vanish across the guardrail round-trip.
 
-    Two tools in, one out. Found while fixing the advisor case and initially assumed to
-    share its root cause; measurement showed otherwise, hence the xfail above. Needs its
-    own patch in ``_translate_to_openai``.
+    Two tools in, one out. Was a strict xfail, because the loss is upstream of the code
+    ARC-BUG-45 touched: ``_translate_to_openai`` partitions the tool out of ``tools``
+    before the tool translation runs, so the writeback had nothing to put back.
+
+    ✅ Closed by [ARC-BUG-51]: ``_diverted_tools`` recovers every caller tool that never
+    reached the guardrail — by difference against what the translation produced, so it
+    covers any diverted type rather than an enumerated list — and the writeback
+    re-attaches them.
     """
     from litellm.llms.anthropic.chat.guardrail_translation.handler import (
         AnthropicMessagesHandler,
