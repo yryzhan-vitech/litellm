@@ -568,7 +568,39 @@ class AnthropicMessagesHandler(BaseTranslation):
             content = msg.get("content")
             if isinstance(content, list):
                 for block in content:
-                    if isinstance(block, dict) and block.get("type") == "thinking":
+                    # [ARC-BUG-55] BOTH reasoning block types, not just `thinking`.
+                    #
+                    # Anthropic rejects a replayed reasoning block that differs from the
+                    # original response by a single byte:
+                    #
+                    #   messages.N.content.M: `thinking` or `redacted_thinking` blocks in the
+                    #   latest assistant message cannot be modified. These blocks must remain
+                    #   as they were in the original response.
+                    #
+                    # That 400 is the highest-volume client-visible error on prd-ai — 304
+                    # alerts 2026-08-05 → 08-10, still firing. It was attributed to the client
+                    # on the reasoning that we only ever write blocks carrying a `text` key,
+                    # which reasoning blocks lack. WRONG: this method replaces the ENTIRE
+                    # `data["messages"]` array, and the round-trip injects a field.
+                    #
+                    # Measured on this exact function — a `redacted_thinking` block went in as
+                    # `{type, data}` and came out as `{type, data, cache_control: {}}`. The
+                    # empty dict originates at
+                    # `adapters/transformation.py:577`, whose
+                    # `cache_control=content.get("cache_control", {})` MATERIALISES the field
+                    # with a default rather than omitting it. The cleanup below existed for
+                    # exactly this reason but only matched `type == "thinking"`, so
+                    # `redacted_thinking` sailed through with the injected key. A `thinking` +
+                    # `text` turn was byte-identical; add a `redacted_thinking` block and the
+                    # request is altered.
+                    #
+                    # ⚠️ Popping an EMPTY cache_control is safe and popping a real one is the
+                    # lesser evil: a reasoning block that must be replayed verbatim cannot
+                    # carry a cache breakpoint the original response did not have, and losing
+                    # a caching hint costs money while an altered block costs the whole
+                    # request. Keyed on the block type rather than on emptiness so a
+                    # caller-supplied `cache_control` cannot slip a mutation through either.
+                    if isinstance(block, dict) and block.get("type") in ("thinking", "redacted_thinking"):
                         block.pop("cache_control", None)
         data["messages"] = converted
 
