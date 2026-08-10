@@ -201,7 +201,9 @@ class TestPostRetriesInPlace:
         monkeypatch.setattr(handler, "single_connection_post_request", retried)
         monkeypatch.setattr(handler, "create_client", MagicMock(return_value=AsyncMock()))
 
-        result = await handler.post(url="https://example.invalid/scan", json={"a": 1})
+        result = await handler.post(
+            url="https://example.invalid/scan", json={"a": 1}, retry_on_broken_pooled_connection=True
+        )
 
         assert result is ok, "the retry's response was not returned"
         assert retried.await_count == 1, "the retry never fired"
@@ -221,7 +223,12 @@ class TestPostRetriesInPlace:
         monkeypatch.setattr(handler, "create_client", create_client)
         monkeypatch.setattr(handler, "single_connection_post_request", AsyncMock(return_value=self._ok_response()))
 
-        await handler.post(url="https://example.invalid/scan", json={"a": 1}, timeout=10.0)
+        await handler.post(
+            url="https://example.invalid/scan",
+            json={"a": 1},
+            timeout=10.0,
+            retry_on_broken_pooled_connection=True,
+        )
 
         granted = create_client.call_args.kwargs["timeout"]
         # `<= 10.0`, not `< 10.0`: a mocked transport fails in ~0 s, so the deduction
@@ -263,7 +270,12 @@ class TestPostRetriesInPlace:
         monkeypatch.setattr(handler, "create_client", create_client)
         monkeypatch.setattr(handler, "single_connection_post_request", AsyncMock(return_value=self._ok_response()))
 
-        await handler.post(url="https://example.invalid/scan", json={"a": 1}, timeout=1000.0)
+        await handler.post(
+            url="https://example.invalid/scan",
+            json={"a": 1},
+            timeout=1000.0,
+            retry_on_broken_pooled_connection=True,
+        )
 
         granted = create_client.call_args.kwargs["timeout"]
         assert granted < 1000.0, (
@@ -289,7 +301,12 @@ class TestPostRetriesInPlace:
         monkeypatch.setattr(handler, "create_client", MagicMock(return_value=AsyncMock()))
 
         with pytest.raises(litellm.Timeout) as raised:
-            await handler.post(url="https://example.invalid/scan", json={"a": 1}, timeout=10.0)
+            await handler.post(
+                url="https://example.invalid/scan",
+                json={"a": 1},
+                timeout=10.0,
+                retry_on_broken_pooled_connection=True,
+            )
 
         assert "Timeout passed=" in str(raised.value)
         assert retried.await_count == 0, "a genuine expiry must NOT be retried"
@@ -311,4 +328,39 @@ class TestPostRetriesInPlace:
         )
 
         with pytest.raises(litellm.Timeout):
-            await handler.post(url="https://example.invalid/scan", json={"a": 1}, timeout=10.0)
+            await handler.post(
+                url="https://example.invalid/scan",
+                json={"a": 1},
+                timeout=10.0,
+                retry_on_broken_pooled_connection=True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_retry_is_OFF_by_default(self, monkeypatch):
+        """🔴 The whole safety model: this handler is shared by 377 `.post()` call sites.
+
+        Among them are non-idempotent billing writes (`integrations/lago.py`,
+        `integrations/openmeter.py`) and Slack alerting. The retry's safety argument — "a
+        broken pooled connection means the peer never received it" — holds for the
+        client-to-immediate-peer TCP leg, but every consumer sits behind a gateway, and a
+        `SocketTimeoutError` says nothing about whether that gateway had already forwarded
+        the request upstream. Likeliest is not proven, so the default must not retry.
+
+        Raised by an adversarial review, which found the Lago call site and correctly
+        refused to accept "provably safe for every caller" as asserted rather than shown.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        import litellm
+
+        handler = self._handler([_timeout_exc(aiohttp.SocketTimeoutError)])
+        retried = AsyncMock()
+        monkeypatch.setattr(handler, "single_connection_post_request", retried)
+        monkeypatch.setattr(handler, "create_client", MagicMock(return_value=AsyncMock()))
+
+        with pytest.raises(litellm.Timeout):
+            await handler.post(url="https://example.invalid/billing-event", json={"amount": 1}, timeout=10.0)
+
+        assert retried.await_count == 0, (
+            "a caller that did not opt in was silently retried — a non-idempotent POST could be delivered twice"
+        )

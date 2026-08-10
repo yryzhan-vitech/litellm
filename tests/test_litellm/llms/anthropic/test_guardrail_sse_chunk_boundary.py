@@ -167,3 +167,34 @@ def test_bytes_and_dict_chunks_mix_without_double_counting(handler):
     """
     dict_chunk = {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "+from-dict"}}
     assert handler.get_streaming_string_so_far([*_halves(TEXT_DELTA), dict_chunk]) == "SENSITIVE PHRASE+from-dict"
+
+
+def test_an_unrecoverable_truncated_byte_does_not_raise(handler):
+    """The `errors="ignore"` backstop must itself be tested.
+
+    A multi-byte character straddling a boundary is repaired by joining — that case is
+    covered above. This is the case joining CANNOT repair: the stream's FINAL chunk ends
+    on a lead byte whose continuation never arrives, so the joined buffer is genuinely
+    undecodable. Strict decoding raises `UnicodeDecodeError` there, and since this runs
+    inside the guardrail's output path a raise would fail the request instead of the check
+    — turning a truncated tail into a client-visible error.
+
+    Found by mutation testing: dropping `errors="ignore"` left all twelve other tests
+    green, because every one of them supplies both halves of any split character.
+    """
+    truncated_tail = MESSAGE_STOP + "é".encode()[:1]  # lone 0xC3 lead byte, no continuation
+
+    assert handler._check_streaming_has_ended([truncated_tail]) is True, (
+        "an undecodable tail must not hide the end-of-stream signal that precedes it"
+    )
+
+
+def test_an_undecodable_chunk_does_not_lose_the_text_before_it(handler):
+    """Same backstop on the text-extraction path, which feeds the scan payload.
+
+    A raise here would be worse than on the end-of-stream check: the guardrail would
+    receive nothing and the response would go out unscanned.
+    """
+    truncated_tail = TEXT_DELTA + "🎉".encode()[:2]  # two of four bytes
+
+    assert handler.get_streaming_string_so_far([truncated_tail]) == "SENSITIVE PHRASE"

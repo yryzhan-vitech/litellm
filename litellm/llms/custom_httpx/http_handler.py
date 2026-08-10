@@ -700,6 +700,7 @@ class AsyncHTTPHandler:
         logging_obj: Optional[LiteLLMLoggingObject] = None,
         files: Optional[RequestFiles] = None,
         content: Any = None,
+        retry_on_broken_pooled_connection: bool = False,
     ):
         start_time = time.time()
         try:
@@ -779,7 +780,33 @@ class AsyncHTTPHandler:
             # ⚠️ The remaining budget is inherited, not reset: a retry must not grant the
             # request a second full deadline, or one dead connection doubles the worst-case
             # latency the caller budgeted for.
-            if self._is_broken_pooled_connection(exc=e, stream=stream, elapsed=time_delta, timeout=timeout):
+            #
+            # 🔴 OPT-IN PER CALL SITE, and that is a deliberate narrowing after review.
+            # This handler is shared by 377 `.post()` call sites, including
+            # non-idempotent billing writes (`integrations/lago.py`,
+            # `integrations/openmeter.py`) and Slack alerting. The safety argument for the
+            # retry is "a broken pooled connection means the peer never received it" —
+            # which holds for the client-to-immediate-peer TCP leg, but every consumer
+            # here sits behind a load balancer or gateway, and a SocketTimeoutError says
+            # nothing about whether that gateway had already forwarded the request
+            # upstream before the near leg died. The measured elapsed times (p50 36 ms,
+            # max 93 ms) make "never reached any app layer" by far the likeliest reading,
+            # but likeliest is not proven, and a shared default must not rest on it.
+            #
+            # So callers opt in. Anything with a side effect must supply its own
+            # idempotency key before enabling this, rather than inheriting the retry
+            # silently.
+            #
+            # ⚠️ NO CALLER ENABLES IT YET, and Noma deliberately does not: site A
+            # (`noma_v2.py:431`) already retries this exact failure with its own budget
+            # gate and its own logging, so switching this on there would retry twice for
+            # one dead connection. This arm exists for the OTHER consumers of the shared
+            # handler, which today have no equivalent — a provider leg that dies on a
+            # recycled keep-alive still reports a deadline expiry it never had. Enabling it
+            # per call site is a separate, reviewable change with its own blast radius.
+            if retry_on_broken_pooled_connection and self._is_broken_pooled_connection(
+                exc=e, stream=stream, elapsed=time_delta, timeout=timeout
+            ):
                 remaining = self._remaining_timeout(timeout=timeout, elapsed=time_delta)
                 verbose_logger.warning(
                     "[ARC-BUG-47] Retrying POST on a fresh connection: SocketTimeoutError after "
