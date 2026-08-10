@@ -60,6 +60,13 @@ if TYPE_CHECKING:
     )
 
 
+# [ARC-BUG-49] Recorded in a task mapping for content that is scanned but must never
+# be written back. Any index the write-back cannot resolve makes the write a no-op;
+# -1 is chosen because both write-backs bounds-check with `>= len(content)` and a
+# negative index would otherwise silently address the LAST block from the end.
+_UNWRITABLE_CONTENT_IDX = -1
+
+
 def _is_anthropic_native_tool(tool: Any) -> bool:
     """[ARC-BUG-45] Did the forward leg keep this tool in Anthropic form?
 
@@ -841,7 +848,11 @@ class AnthropicMessagesHandler(BaseTranslation):
             else:
                 continue
 
-            if block_type in ["text", "tool_use"]:
+            # [ARC-BUG-49] `thinking` joins the dispatch list. Without it the block never
+            # reaches `_extract_output_text_and_images`, so its prose was never scanned —
+            # the coverage hole this fixes. `redacted_thinking` stays out: its `data` is an
+            # opaque server-encrypted blob, not prose, so a scan of it is pure noise.
+            if block_type in ["text", "tool_use", "thinking"]:
                 self._extract_output_text_and_images(
                     content_block=block_dict,
                     content_idx=content_idx,
@@ -1073,6 +1084,32 @@ class AnthropicMessagesHandler(BaseTranslation):
                 texts_to_check.append(content_text)
                 task_mappings.append((content_idx, None))
 
+        # [ARC-BUG-49] Extended-thinking content is scanned, READ-ONLY.
+        #
+        # `thinking` carries its prose under a `thinking` key, not `text`, so it was
+        # invisible to the branch above and reached the model uninspected — a real
+        # coverage hole, and one the caller can steer, since the model's reasoning is
+        # shaped by the prompt.
+        #
+        # ⚠️ The mapping is deliberately (content_idx, None) with the SENTINEL index
+        # -1 recorded instead of a real one: Anthropic rejects a request whose
+        # `thinking` or `redacted_thinking` block differs by a single byte from the
+        # original response ("blocks in the latest assistant message cannot be
+        # modified"), and that 400 is the highest-volume client-visible error on
+        # prd-ai. So this must never become writable. The write-back is already gated
+        # on `type == "text"` at both call sites, which makes a mis-index a no-op
+        # rather than a corruption — but recording -1 means even a future edit that
+        # loosens that gate cannot land a guardrail response on a thinking block.
+        #
+        # `redacted_thinking` is deliberately NOT extracted: its `data` is an opaque
+        # server-encrypted blob, not prose, so scanning it yields noise and the
+        # guardrail has nothing to act on.
+        elif content_type == "thinking":
+            thinking_text = content_block.get("thinking")
+            if thinking_text and isinstance(thinking_text, str):
+                texts_to_check.append(thinking_text)
+                task_mappings.append((_UNWRITABLE_CONTENT_IDX, None))
+
         # Extract tool calls
         elif content_type == "tool_use":
             tool_call = AnthropicConfig.convert_tool_use_to_openai_format(
@@ -1109,6 +1146,13 @@ class AnthropicMessagesHandler(BaseTranslation):
                 continue
 
             if not response_content:
+                continue
+
+            # [ARC-BUG-49] Scanned-but-unwritable content (extended thinking) records
+            # a sentinel index. Reject it before indexing: a negative index would
+            # otherwise address a block from the END of the list and overwrite the
+            # wrong one, which for a thinking block earns a hard 400 from Anthropic.
+            if content_idx == _UNWRITABLE_CONTENT_IDX:
                 continue
 
             # Get the content block at the index
