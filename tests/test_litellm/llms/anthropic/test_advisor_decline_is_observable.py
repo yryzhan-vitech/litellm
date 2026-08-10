@@ -127,3 +127,26 @@ def test_a_dated_advisor_tool_variant_still_counts_as_advisor(handler, declines)
 def test_a_malformed_tool_list_does_not_raise(handler):
     """`tools` is caller input — a non-dict entry must not crash the gate."""
     assert handler.can_handle(tools=["not-a-dict", None, 42], custom_llm_provider="anthropic") is False
+
+
+def test_the_orchestration_sub_calls_cannot_re_trigger_the_decline(handler, declines):
+    """The count must be per REQUEST, not per orchestration round.
+
+    Raised by an adversarial review: the advisor loop's sub-calls go back through
+    `anthropic_messages()`, which runs this gate again — so an inflated count was a real
+    possibility, and a metric that multiplies by round count is worse than no metric.
+
+    It cannot happen, and the reason is structural rather than lucky:
+      * the EXECUTOR leg is handed the SYNTHETIC tool, which has a `name` of "advisor" but
+        NO `type` — and `is_advisor_tool` matches on the dated `type` prefix, so it reads
+        False;
+      * the ADVISOR leg is called with `tools=None`, which exits at the first check.
+
+    Asserted rather than trusted, because "the synthetic tool has no type" is exactly the
+    kind of invariant a later refactor tidies away.
+    """
+    synthetic = {"name": "advisor", "description": "the synthetic executor-facing tool", "input_schema": {}}
+
+    assert handler.can_handle(tools=[synthetic], custom_llm_provider="anthropic") is False
+    assert handler.can_handle(tools=None, custom_llm_provider="anthropic") is False
+    assert declines() == [], "an orchestration sub-call logged a decline and inflated the count"

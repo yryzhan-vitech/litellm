@@ -60,10 +60,19 @@ if TYPE_CHECKING:
     )
 
 
-# [ARC-BUG-49] Recorded in a task mapping for content that is scanned but must never
-# be written back. Any index the write-back cannot resolve makes the write a no-op;
-# -1 is chosen because both write-backs bounds-check with `>= len(content)` and a
-# negative index would otherwise silently address the LAST block from the end.
+# [ARC-BUG-49] Recorded in a task mapping for content that is scanned but must NEVER be
+# written back — today that is extended-thinking prose, which Anthropic rejects if it comes
+# back altered by a single byte.
+#
+# 🔴 The explicit sentinel check in both write-backs is LOAD-BEARING, not a second line of
+# defence. An earlier version of this comment claimed the `type == "text"` gate made a
+# mis-index harmless; an adversarial review refuted that by execution and was right. With
+# `thinking` FIRST and a text block LAST, `-1` resolves to that text block, whose type IS
+# "text" — so the type gate permits the write and the thinking scan's verdict overwrites
+# the real answer. Removing either guard is a live corruption, not a tidy-up.
+#
+# -1 rather than a large number because both write-backs bounds-check with
+# `>= len(content)`, which a negative index passes silently.
 _UNWRITABLE_CONTENT_IDX = -1
 
 
@@ -1165,15 +1174,17 @@ class AnthropicMessagesHandler(BaseTranslation):
         # coverage hole, and one the caller can steer, since the model's reasoning is
         # shaped by the prompt.
         #
-        # ⚠️ The mapping is deliberately (content_idx, None) with the SENTINEL index
-        # -1 recorded instead of a real one: Anthropic rejects a request whose
-        # `thinking` or `redacted_thinking` block differs by a single byte from the
-        # original response ("blocks in the latest assistant message cannot be
-        # modified"), and that 400 is the highest-volume client-visible error on
-        # prd-ai. So this must never become writable. The write-back is already gated
-        # on `type == "text"` at both call sites, which makes a mis-index a no-op
-        # rather than a corruption — but recording -1 means even a future edit that
-        # loosens that gate cannot land a guardrail response on a thinking block.
+        # ⚠️ The mapping records the SENTINEL index, not the block's real position:
+        # Anthropic rejects a request whose `thinking` or `redacted_thinking` block
+        # differs by a single byte from the original response ("blocks in the latest
+        # assistant message cannot be modified"), and that 400 is the highest-volume
+        # client-visible error on prd-ai. So this must never become writable.
+        #
+        # 🔴 The sentinel is the ONLY thing that makes it unwritable. The `type == "text"`
+        # gate in the write-backs does NOT independently save it — with `thinking` first
+        # and a text block last, `-1` resolves to that text block, which passes the type
+        # gate, and the thinking scan's verdict lands on the real answer. Measured, and
+        # covered by `test_the_thinking_response_does_not_land_on_a_trailing_text_block`.
         #
         # `redacted_thinking` is deliberately NOT extracted: its `data` is an opaque
         # server-encrypted blob, not prose, so scanning it yields noise and the
