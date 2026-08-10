@@ -51,6 +51,39 @@ class AdvisorOrchestrationHandler(MessagesInterceptor):
             return False
         has_advisor = any(is_advisor_tool(t) for t in tools)
         is_non_native = custom_llm_provider not in ADVISOR_NATIVE_PROVIDERS
+
+        # [ARC-BUG-53] Log the DECLINE, not just the accept.
+        #
+        # A request that carries an advisor tool and is declined here completes as an
+        # ordinary 200 with no advisor output and NO trace of the decision anywhere —
+        # the tool was asked for, the orchestration silently did not run, and the model
+        # answered on its own. That is exactly what users reported as "/advisor does not
+        # fire and the model runs its own adversarial review", and one reporter presented
+        # advisor findings then apologised for having invented them.
+        #
+        # Until now this path was invisible BY CONSTRUCTION: it emits nothing, so no grep
+        # and no metric could distinguish "the advisor ran" from "the advisor was asked
+        # for and skipped". The hypothesis was provable as code and unobservable in
+        # traffic. This makes the decline greppable.
+        #
+        # ⚠️ `.warning()`, not `.info()`: prd-ai runs `LITELLM_LOG=ERROR`, under which an
+        # info line does not exist to grep for at all — the trap that made 142
+        # `grep -i fallback` hits turn out to be stack-frame names rather than events.
+        # WARNING is the lowest level that survives there while staying below ERROR,
+        # because a decline is a routing decision, not a failure.
+        #
+        # ⚠️ Only the DECLINE is logged. Logging every accept would add a line to every
+        # advisor request on a proxy that already emits ~1 000 req/pod/h, and the accept
+        # is already observable — it produces advisor sub-call frames.
+        if has_advisor and not is_non_native:
+            verbose_logger.warning(
+                "[ARC-BUG-53] advisor orchestration DECLINED: an advisor tool was present but "
+                "provider=%s is in ADVISOR_NATIVE_PROVIDERS, so this request is passed through "
+                "unorchestrated and will return no advisor output. tools=%d",
+                custom_llm_provider,
+                len(tools),
+            )
+
         return has_advisor and is_non_native
 
     async def handle(
