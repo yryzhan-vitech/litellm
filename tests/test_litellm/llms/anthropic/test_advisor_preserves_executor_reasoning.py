@@ -110,25 +110,113 @@ def test_block_order_within_the_turn_is_preserved():
     assert [b.get("type") for b in blocks] == ["thinking", "text", "redacted_thinking"]
 
 
-def test_tool_use_is_still_excluded():
-    """🔴 Negative control, and a documented remaining exposure.
+def test_a_carried_tool_use_is_paired_with_a_result():
+    """[ARC-BUG-57] Both Anthropic rules hold at once — they were never in real conflict.
 
-    `tool_use` must stay out: Anthropic requires it to be followed immediately by its
-    `tool_result`, not by the advisor question. So this exclusion is deliberate — but it is
-    also still a block-set change to the latest assistant turn, which can trip the same 400
-    on a `['thinking', 'tool_use']` response. The two rules conflict on that shape.
+    Anthropic requires (a) the latest assistant turn to match what it returned, and (b) a
+    `tool_use` to be followed immediately by its `tool_result`. Dropping the `tool_use` broke
+    (a) to satisfy (b), which kept the ARC-BUG-56 400 alive for `['thinking', 'tool_use']` —
+    the most common extended-thinking shape when the executor calls a tool.
 
-    Pinned so that "fix ARC-BUG-56 by carrying everything" cannot be done accidentally
-    without confronting that conflict.
+    The fix carries the tool call verbatim and emits a synthetic `tool_result` in the user
+    turn immediately after, before the advisor question. This asserts BOTH properties, so a
+    future change cannot restore one by sacrificing the other.
     """
     executor_response = {"content": [copy.deepcopy(THINKING), copy.deepcopy(TOOL_USE)]}
 
-    blocks = _latest_assistant_blocks(
-        _build_advisor_context(copy.deepcopy(CONVERSATION), executor_response, ADVISOR_USE)
-    )
+    result = _build_advisor_context(copy.deepcopy(CONVERSATION), executor_response, ADVISOR_USE)
 
-    assert not any(b.get("type") == "tool_use" for b in blocks), "tool_use must not reach the advisor"
-    assert any(b.get("type") == "thinking" for b in blocks), "thinking must still be carried"
+    assistant_idx = max(i for i, m in enumerate(result) if m.get("role") == "assistant")
+    blocks = result[assistant_idx]["content"]
+
+    # (a) the turn is byte-identical to what the executor returned
+    assert blocks == [THINKING, TOOL_USE], f"the returned turn was altered: {blocks!r}"
+
+    # (b) every tool_use is resolved in the very next turn
+    following = result[assistant_idx + 1]
+    assert following["role"] == "user", "a tool_use must be followed by a user turn"
+    results = [b for b in following["content"] if b.get("type") == "tool_result"]
+    assert [r["tool_use_id"] for r in results] == [TOOL_USE["id"]], f"unpaired tool_use: {results!r}"
+
+    # the advisor question is still last, in its own turn
+    assert result[-1] == {"role": "user", "content": "review this"}
+
+
+def test_parallel_tool_calls_each_get_their_own_result():
+    """A turn can carry several tool calls; every one needs its own result or the API 400s.
+
+    Without this, a fix that emitted a single result would pass the single-tool test above
+    and fail on the parallel-call shape Claude Code produces routinely.
+    """
+    second_tool = {"type": "tool_use", "id": "toolu_02B", "name": "Read", "input": {"path": "/x"}}
+    executor_response = {
+        "content": [copy.deepcopy(THINKING), copy.deepcopy(TOOL_USE), copy.deepcopy(second_tool)]
+    }
+
+    result = _build_advisor_context(copy.deepcopy(CONVERSATION), executor_response, ADVISOR_USE)
+
+    assistant_idx = max(i for i, m in enumerate(result) if m.get("role") == "assistant")
+    results = [b for b in result[assistant_idx + 1]["content"] if b.get("type") == "tool_result"]
+
+    assert [r["tool_use_id"] for r in results] == [TOOL_USE["id"], second_tool["id"]]
+
+
+def test_the_synthetic_result_is_marked_as_an_error():
+    """It must not read as 'the tool ran and returned nothing'.
+
+    A neutral empty result would let the advisor reason about a fabricated observation —
+    the exact failure class that produced invented advisor findings in the first place.
+    """
+    executor_response = {"content": [copy.deepcopy(THINKING), copy.deepcopy(TOOL_USE)]}
+
+    result = _build_advisor_context(copy.deepcopy(CONVERSATION), executor_response, ADVISOR_USE)
+
+    assistant_idx = max(i for i, m in enumerate(result) if m.get("role") == "assistant")
+    synthetic = next(b for b in result[assistant_idx + 1]["content"] if b.get("type") == "tool_result")
+
+    assert synthetic["is_error"] is True, "a placeholder result must be flagged as not-executed"
+    assert "not executed" in synthetic["content"], f"unclear placeholder: {synthetic['content']!r}"
+
+
+def test_the_advisors_own_invocation_is_still_excluded():
+    """🔴 The one exclusion that remains, and it is deliberate.
+
+    The advisor's `server_tool_use` is the block being HANDLED: its result does not exist
+    yet, so echoing it back would ask the advisor to review its own pending invocation — and
+    it could not be paired with a result either.
+
+    A genuine `server_tool_use` (e.g. web_search) IS carried, so this must key on the
+    advisor name, not on the block type.
+    """
+    advisor_invocation = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_advisor",
+        "name": "advisor",
+        "input": {"question": "review this"},
+    }
+    web_search = {"type": "server_tool_use", "id": "srvtoolu_web", "name": "web_search", "input": {"q": "x"}}
+    executor_response = {
+        "content": [copy.deepcopy(THINKING), copy.deepcopy(advisor_invocation), copy.deepcopy(web_search)]
+    }
+
+    result = _build_advisor_context(copy.deepcopy(CONVERSATION), executor_response, ADVISOR_USE)
+
+    assistant_idx = max(i for i, m in enumerate(result) if m.get("role") == "assistant")
+    blocks = result[assistant_idx]["content"]
+
+    assert blocks == [THINKING, web_search], f"wrong blocks carried: {blocks!r}"
+    ids = [b["tool_use_id"] for b in result[assistant_idx + 1]["content"]]
+    assert ids == [web_search["id"]], f"the advisor's own call was paired with a result: {ids!r}"
+
+
+def test_no_empty_user_turn_when_there_are_no_tool_calls():
+    """A text-only response must not gain a stray empty turn."""
+    executor_response = {"content": [copy.deepcopy(THINKING), copy.deepcopy(TEXT)]}
+
+    result = _build_advisor_context(copy.deepcopy(CONVERSATION), executor_response, ADVISOR_USE)
+
+    assert result[-1] == {"role": "user", "content": "review this"}
+    assert all(m.get("content") not in ([], None) for m in result), f"an empty turn was added: {result!r}"
 
 
 def test_provider_specific_fields_are_still_stripped():

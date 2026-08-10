@@ -60,14 +60,26 @@ def _tool_use_pairs(messages):
     return out
 
 
-def test_round_one_context_carries_no_tool_use():
-    """The executor's newest response IS filtered — only its text blocks survive."""
+def test_round_one_context_leaves_no_unpaired_tool_use():
+    """Every carried tool call is resolved; the advisor's own invocation is not carried.
+
+    🔴 Rewritten for [ARC-BUG-57]. This test previously asserted `_tool_use_pairs(ctx) == []`
+    — i.e. that NO tool call reaches the advisor at all — which characterised the behaviour
+    that CAUSED the prd-ai 400s: dropping the executor's `tool_use` altered the latest
+    assistant turn, and Anthropic rejects a modified reasoning turn.
+
+    The invariant it was really protecting is adjacency, not absence. So it now asserts the
+    thing that actually matters: no tool call is left unpaired. Carrying a call verbatim and
+    resolving it in the next turn satisfies both Anthropic rules at once.
+    """
     ctx = _build_advisor_context(
         [{"role": "user", "content": "Review my plan."}],
         _executor_response({"type": "text", "text": "Here is my plan."}, ADVISOR_USE),
         ADVISOR_USE,
     )
-    assert _tool_use_pairs(ctx) == []
+
+    unpaired = [tid for tid, satisfied in _tool_use_pairs(ctx) if not satisfied]
+    assert unpaired == [], f"tool_use with no adjacent tool_result: {unpaired}"
     assert ctx[-1] == {"role": "user", "content": "Is this approach sound?"}
 
 

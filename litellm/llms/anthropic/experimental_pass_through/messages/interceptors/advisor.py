@@ -653,25 +653,75 @@ def _build_advisor_context(
     ⚠️ `tool_use` / `server_tool_use` stay excluded, and that exclusion is now the ONLY
     block-set change this function makes. It is required for a different Anthropic rule —
     a `tool_use` must be followed immediately by its `tool_result`, not by the advisor
-    question. Dropping a `tool_use` from the latest turn can therefore still trip the same
-    400. Not fixed here because the two rules are in direct conflict on that shape and
-    resolving it needs its own change; recorded so the remaining exposure is known rather
-    than assumed closed.
+    question.
+
+    [ARC-BUG-57] Those two rules are NOT actually in conflict, and both are now satisfied.
+    An earlier version of this note claimed they were and left `tool_use` dropped — which
+    kept the ARC-BUG-56 400 alive for a `['thinking', 'tool_use']` response, the single most
+    common extended-thinking shape when the executor calls a tool.
+
+    The resolution: carry the `tool_use` blocks verbatim, then satisfy the pairing rule by
+    emitting a synthetic `tool_result` for each one in a user turn placed BEFORE the advisor
+    question. So the array reads
+
+        assistant: [thinking, text, tool_use]        <- byte-identical to what was returned
+        user:      [tool_result, ...]                <- one per tool_use, synthetic
+        user:      "the advisor question"
+
+    The advisor is being asked to review reasoning, not to execute tools, so a placeholder
+    result is honest: it says the call was not run on this leg rather than inventing output.
+    The EXECUTOR's own continuation is unaffected — it goes through `_inject_advisor_turn`,
+    which carries the real content and the real results.
+
+    ⚠️ The synthetic result is marked `is_error: True`. A neutral-looking empty result would
+    read as "the tool ran and returned nothing", which could make the advisor reason about a
+    fabricated observation — the exact failure class that produced invented advisor findings
+    in the first place. It must be unmistakably "not executed".
+
+    ⚠️ Two consecutive user turns are legal in the Anthropic API, and keeping them separate
+    matters: merging the results into the question turn would put a `tool_result` beside
+    prose, and merging the question into the results turn would bury it. Both were rejected.
+
+    ⚠️ `advisor`'s own `server_tool_use` block stays OUT, and it is the one exclusion that
+    remains. It is not a general tool call — it is the block being handled, its result does
+    not exist yet, and echoing it back would ask the advisor to review its own pending
+    invocation. `strip_advisor_blocks_from_messages` already removes prior advisor exchanges
+    from the history for the same reason.
     """
     question = (advisor_use_block.get("input") or {}).get("question") or (
         "Please provide guidance on the current task."
     )
     raw_content = (executor_response.get("content") if isinstance(executor_response, dict) else []) or []
-    # Keep text AND reasoning blocks; strip tool_use and provider-specific fields.
-    carried_types = ("text", "thinking", "redacted_thinking")
+
+    def _is_advisor_invocation(block: dict) -> bool:
+        """The advisor's own pending call — not a tool the executor asked to run."""
+        return block.get("type") == "server_tool_use" and block.get("name") == "advisor"
+
+    carried_types = ("text", "thinking", "redacted_thinking", "tool_use", "server_tool_use")
     executor_text_blocks = [
         {k: v for k, v in block.items() if k not in _PROVIDER_SPECIFIC_KEYS}
         for block in raw_content
-        if isinstance(block, dict) and block.get("type") in carried_types
+        if isinstance(block, dict) and block.get("type") in carried_types and not _is_advisor_invocation(block)
     ]
+
+    # Every carried tool call needs its result in the very next turn, or Anthropic 400s on
+    # the pairing rule instead of the immutability rule.
+    unresolved_tool_results = [
+        {
+            "type": "tool_result",
+            "tool_use_id": block["id"],
+            "content": "[not executed: this turn was diverted to an advisor review]",
+            "is_error": True,
+        }
+        for block in executor_text_blocks
+        if block.get("type") in ("tool_use", "server_tool_use") and block.get("id")
+    ]
+
     result = _drop_illegal_system_turns(messages)
     if executor_text_blocks:
         result.append({"role": "assistant", "content": executor_text_blocks})
+        if unresolved_tool_results:
+            result.append({"role": "user", "content": unresolved_tool_results})
     result.append({"role": "user", "content": question})
     return result
 
