@@ -312,3 +312,112 @@ def test_the_inner_extractor_alone_refuses_redacted_thinking():
 
     assert texts == [], f"the encrypted blob reached the scanner: {texts}"
     assert mappings == [], f"a mapping was created for an unscannable block: {mappings}"
+
+
+def test_a_short_guardrail_reply_does_not_shift_verdicts_onto_the_wrong_block():
+    """🔴 The write-back is positional, and nothing guarantees the counts match.
+
+    Noma's `_apply_action` replaces `texts` WHOLESALE with whatever its API returned, so the
+    reply length is vendor-controlled. Measured on the unguarded loop with three scanned
+    segments and two returned texts: the verdict meant for the SECOND answer was written
+    onto the FIRST. Silent, and the output looks plausible — the worst failure mode a
+    guardrail can have.
+
+    ARC-BUG-49 increased this exposure rather than creating it: `texts_to_check` now carries
+    a thinking entry a guardrail may legitimately not echo back, so the mismatch became
+    reachable on ordinary traffic instead of only on a misbehaving vendor.
+
+    The fix declines the whole write-back, because once the counts differ there is no way to
+    know which verdict belongs to which block. Leaving the response unmodified is a scan
+    that did not take effect; writing a verdict onto the wrong block publishes an answer
+    nobody generated.
+    """
+    blocks = [
+        copy.deepcopy(THINKING),
+        {"type": "text", "text": "ANSWER-ONE"},
+        {"type": "text", "text": "ANSWER-TWO"},
+    ]
+    response = {"model": "claude-sonnet-5", "content": blocks}
+
+    texts, mappings = _extract(blocks)
+    assert len(texts) == 3 and len(mappings) == 3, f"precondition: {texts} {mappings}"
+
+    # The guardrail returns only two texts for three scanned segments.
+    asyncio.run(
+        AnthropicMessagesHandler()._apply_guardrail_responses_to_output(
+            response=response,
+            responses=["VERDICT-A", "VERDICT-B"],
+            task_mappings=mappings,
+        )
+    )
+
+    assert blocks[1]["text"] == "ANSWER-ONE", (
+        f"a shifted verdict was published as the first answer: {blocks[1]['text']!r}"
+    )
+    assert blocks[2]["text"] == "ANSWER-TWO", "the second answer was altered"
+    assert blocks[0] == THINKING, "the thinking block was modified"
+
+
+def test_a_long_guardrail_reply_does_not_raise():
+    """The mirror case: more texts than mappings used to be an IndexError, i.e. a 500.
+
+    A 500 on a request the guardrail APPROVED is a self-inflicted outage. Measured: the
+    unguarded loop raised `IndexError: list index out of range`.
+    """
+    blocks = [{"type": "text", "text": "ANSWER"}]
+    response = {"model": "claude-sonnet-5", "content": blocks}
+
+    texts, mappings = _extract(blocks)
+    assert len(mappings) == 1, f"precondition: {mappings}"
+
+    asyncio.run(
+        AnthropicMessagesHandler()._apply_guardrail_responses_to_output(
+            response=response,
+            responses=["V-1", "V-2", "V-3"],
+            task_mappings=mappings,
+        )
+    )
+
+    assert blocks[0]["text"] == "ANSWER", "the response was modified on a count mismatch"
+
+
+def test_a_matching_reply_is_still_applied():
+    """🔴 Negative control: the decline must not swallow the normal case.
+
+    Without this, a fix that declines EVERY write-back would pass both tests above and
+    silently disable output guardrails entirely.
+    """
+    blocks = [{"type": "text", "text": "ANSWER"}]
+    response = {"model": "claude-sonnet-5", "content": blocks}
+
+    texts, mappings = _extract(blocks)
+
+    asyncio.run(
+        AnthropicMessagesHandler()._apply_guardrail_responses_to_output(
+            response=response,
+            responses=["[REDACTED]"],
+            task_mappings=mappings,
+        )
+    )
+
+    assert blocks[0]["text"] == "[REDACTED]", "a matching write-back was declined"
+
+
+def test_thinking_prose_is_scanned_on_the_object_path_too():
+    """A content block object without `model_dump` must not silently skip the scan.
+
+    The object fallback built `{"type": ..., "text": ...}` only, so a `thinking` object was
+    dispatched by the widened gate and then found `thinking = None` — a silent no-op of the
+    whole ARC-BUG-49 fix. Every other test in this file uses plain dicts, so nothing covered
+    it. Measured: the same block scanned as a dict and did not scan as an object.
+    """
+
+    class ThinkingBlockObject:
+        type = "thinking"
+        thinking = "the model's private reasoning"
+        signature = "sig-abc123"
+
+    texts, mappings = _extract([ThinkingBlockObject()])
+
+    assert texts == ["the model's private reasoning"], f"object-path thinking was not scanned: {texts}"
+    assert mappings == [(_UNWRITABLE_CONTENT_IDX, None)], f"wrong mapping: {mappings}"

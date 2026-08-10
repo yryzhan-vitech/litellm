@@ -501,3 +501,100 @@ class TestPostRetriesInPlace:
         assert retried.await_count == 0, (
             "a caller that did not opt in was silently retried — a non-idempotent POST could be delivered twice"
         )
+
+
+class TestTheRetryCarriesTheSameRequest:
+    """🔴 A retry that sends a DIFFERENT body is worse than the timeout it replaces.
+
+    `post()` normalises its arguments through `_prepare_request_data_and_content`, which
+    routes a str/bytes `data` into httpx's `content`. The retry originally forwarded the
+    caller's RAW `data`, so attempt 1 sent `content=b'...'` and the retry sent
+    `content=None` — an empty body. For a guardrail scan that is a POST of nothing that
+    returns 200 and looks authoritative.
+
+    Found by a code review, reproduced, then fixed by forwarding the normalised pair.
+    """
+
+    @staticmethod
+    def _handler_and_recorder(monkeypatch):
+        """A handler whose first attempt breaks and whose retry records its build_request."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        recorded = []
+
+        def _record(*args, **kwargs):
+            # *args because `build_request` is also called positionally ("POST", url) —
+            # a keyword-only recorder raises TypeError inside the mock and the test then
+            # fails for its own reason rather than the code's.
+            recorded.append({key: kwargs.get(key) for key in ("data", "json", "content", "files")})
+            return MagicMock()
+
+        handler = AsyncHTTPHandler(timeout=httpx.Timeout(timeout=10.0))
+        handler.client = MagicMock()
+        handler.client.build_request = MagicMock(side_effect=_record)
+        handler.client.send = AsyncMock(side_effect=[_timeout_exc(aiohttp.SocketTimeoutError)])
+
+        retry_client = MagicMock()
+        retry_client.build_request = MagicMock(side_effect=_record)
+        retry_client.send = AsyncMock(side_effect=httpx.ReadTimeout("the retry timed out too"))
+        retry_client.aclose = AsyncMock()
+        monkeypatch.setattr(handler, "create_client", MagicMock(return_value=retry_client))
+        return handler, recorded
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "kwargs,carried",
+        [
+            ({"content": b'{"scan":"SENSITIVE"}'}, "content"),
+            ({"data": b'{"scan":"SENSITIVE"}'}, "content"),
+            ({"json": {"scan": "SENSITIVE"}}, "json"),
+            ({"data": {"form": "field"}}, "data"),
+        ],
+        ids=["content_bytes", "data_bytes_routed_to_content", "json_dict", "data_dict_form"],
+    )
+    async def test_the_retry_sends_the_same_body(self, monkeypatch, kwargs, carried):
+        """Every body form the caller can supply must survive the retry byte-for-byte."""
+        import litellm
+
+        handler, recorded = self._handler_and_recorder(monkeypatch)
+
+        with pytest.raises(litellm.Timeout):
+            await handler.post(
+                url="https://example.invalid/scan",
+                timeout=10.0,
+                retry_on_broken_pooled_connection=True,
+                **kwargs,
+            )
+
+        assert len(recorded) == 2, f"expected one retry, saw {len(recorded)} attempts"
+        first, retry = recorded
+        assert first[carried], f"precondition: attempt 1 did not carry {carried}"
+        assert retry[carried] == first[carried], (
+            f"the retry changed the request body: attempt1 {carried}={first[carried]!r} "
+            f"retry {carried}={retry[carried]!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_multipart_request_is_not_retried_at_all(self, monkeypatch):
+        """`files` cannot be forwarded, so the retry must be DECLINED, not truncated.
+
+        `single_connection_post_request` takes no `files` parameter. Retrying anyway sent a
+        multipart request with the file part missing — a partial body that succeeds. A
+        request that fails loudly is recoverable; one that succeeds with the wrong payload
+        is not. Measured: attempt 1 carried `files`, the retry carried `files=None`.
+        """
+        import litellm
+
+        handler, recorded = self._handler_and_recorder(monkeypatch)
+
+        with pytest.raises(litellm.Timeout):
+            await handler.post(
+                url="https://example.invalid/scan",
+                data={"field": "value"},
+                files={"upload": b"payload"},
+                timeout=10.0,
+                retry_on_broken_pooled_connection=True,
+            )
+
+        assert len(recorded) == 1, "a multipart request must not be retried"
+        assert recorded[0]["files"], "precondition: attempt 1 did not carry files"

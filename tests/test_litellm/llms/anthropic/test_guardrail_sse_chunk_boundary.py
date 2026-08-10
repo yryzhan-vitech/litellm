@@ -219,7 +219,7 @@ def test_the_skip_marker_is_logged_at_error_so_it_cannot_be_gated_away():
     from litellm.llms.anthropic.chat.guardrail_translation import handler as handler_module
 
     source = inspect.getsource(handler_module)
-    marker = "Guardrail output scan SKIPPED"
+    marker = "Guardrail output scan DEGRADED"
 
     assert source.count(marker) == 1, "more than one skip-log site — update this test"
 

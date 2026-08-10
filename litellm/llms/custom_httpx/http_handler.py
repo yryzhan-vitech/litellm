@@ -604,8 +604,22 @@ class AsyncHTTPHandler:
     # 0.093 s against a 10 s budget — i.e. under 1 % of it. 0.05 leaves the 5–100 % band as
     # neither-retried-nor-misread, deliberately: a failure that spent a twentieth of its
     # budget was doing real work against a real peer, and retrying that doubles latency on
-    # a peer that is merely slow. Mirrors the same constant in noma_v2 (site A) rather than
-    # picking a second number, so the two sites cannot drift apart.
+    # a peer that is merely slow.
+    #
+    # 🔴 **Correction 2026-08-10.** This note claimed it "mirrors the same constant in
+    # noma_v2 (site A)... so the two sites cannot drift apart". They CAN. A code review
+    # pointed out these are two independent literals — `noma_v2._CONNECTION_FAILURE_ELAPSED_
+    # FRACTION = 0.05` and this one — with nothing linking them.
+    #
+    # Not fixed by importing: `noma_v2` imports FROM this module, so importing it back at
+    # module level is a cycle, and a function-local import would put a proxy-layer guardrail
+    # dependency inside the generic HTTP transport — the wrong direction for a shared
+    # low-level client. The honest statement is that the value is duplicated deliberately and
+    # must be changed in both places; the guarantee was never real.
+    #
+    # ⚠️ If you change this, change `_CONNECTION_FAILURE_ELAPSED_FRACTION` in
+    # `litellm/proxy/guardrails/guardrail_hooks/noma/noma_v2.py` to match, or site A and
+    # site C will classify the same failure differently.
     _BROKEN_CONNECTION_ELAPSED_FRACTION = 0.05
 
     @staticmethod
@@ -664,6 +678,31 @@ class AsyncHTTPHandler:
         retry would be wrong. See the call site in ``post`` for why the two obvious
         alternative fixes (reclassifying the mapped exception, or widening the
         RemoteProtocolError arm) are worse than this gate.
+
+        🔴 **A FOURTH condition the plan mandated is NOT implemented, and cannot be here.**
+        The plan required gating on the ``SocketTimeoutError`` cause AND *zero response bytes
+        received*. Only the first half exists. The gap is real: a peer that accepted the
+        request, executed it, began responding, then lost the connection 3 ms in satisfies
+        every condition below — and retrying that double-executes a non-idempotent POST.
+        That is precisely the case the byte-count condition was meant to exclude, and it is
+        the case the call site's central safety claim ("the peer never received it") asserts
+        away rather than proves.
+
+        Why it is not implemented: nothing at this point exposes a byte count. Measured on
+        the real mapped exception — ``exc.request`` raises
+        ``RuntimeError("The .request property has not been set.")``, ``exc.response`` raises
+        ``AttributeError`` (``httpx.TimeoutException`` has no such attribute at all), and the
+        ``aiohttp.SocketTimeoutError`` cause carries only ``OSError`` fields (``errno``,
+        ``strerror``, ``characters_written``) — no bytes-received counter. Implementing it
+        honestly needs a transport-level change to surface the count, which is a wider blast
+        radius than this fix.
+
+        ⚠️ This is why the retry stays OPT-IN and OFF by default. The default is not
+        conservatism about a solved problem; it is the mitigation for an unsolved one. Any
+        call site turning it on is accepting the double-execution risk above and must be
+        idempotent or carry its own idempotency key. Recorded here, at the gate, rather than
+        only in the plan — a reader checking whether the retry is safe looks at this
+        docstring, not at a document.
         """
         if stream:
             # Bytes may already be on their way to the caller; a retry would duplicate a
@@ -804,8 +843,15 @@ class AsyncHTTPHandler:
             # handler, which today have no equivalent — a provider leg that dies on a
             # recycled keep-alive still reports a deadline expiry it never had. Enabling it
             # per call site is a separate, reviewable change with its own blast radius.
-            if retry_on_broken_pooled_connection and self._is_broken_pooled_connection(
-                exc=e, stream=stream, elapsed=time_delta, timeout=timeout
+            # ⚠️ `files` is NOT forwarded by `single_connection_post_request`, so a retry
+            # would silently send a multipart request with the file part missing. Decline
+            # rather than truncate: a request that fails loudly is recoverable, one that
+            # succeeds with a partial body is not. Measured — attempt 1 carried
+            # `files={'f': b'x'}`, the retry carried `files=None`.
+            if (
+                retry_on_broken_pooled_connection
+                and files is None
+                and self._is_broken_pooled_connection(exc=e, stream=stream, elapsed=time_delta, timeout=timeout)
             ):
                 remaining = self._remaining_timeout(timeout=timeout, elapsed=time_delta)
                 verbose_logger.warning(
@@ -819,14 +865,22 @@ class AsyncHTTPHandler:
                 )
                 new_client = self.create_client(timeout=remaining, event_hooks=self.event_hooks)
                 try:
+                    # ⚠️ Forward the NORMALISED body, not the caller's raw `data`.
+                    # `_prepare_request_data_and_content` routes a str/bytes `data` into
+                    # `content` for httpx, so attempt 1 sent `content=` while a retry passing
+                    # `data=data` sent `content=None` — an empty body. For a guardrail that
+                    # means scanning nothing and returning a 200 that looks authoritative:
+                    # strictly worse than the timeout being fixed. Measured on `content=`:
+                    # attempt 1 `content=b'{"scan":...}'`, retry `content=None`.
                     return await self.single_connection_post_request(
                         url=url,
                         client=new_client,
-                        data=data,
+                        data=request_data,
                         json=json,
                         params=params,
                         headers=headers,
                         stream=stream,
+                        content=request_content,
                     )
                 except httpx.TimeoutException as retry_exc:
                     # The retry timed out too. `single_connection_post_request` has no

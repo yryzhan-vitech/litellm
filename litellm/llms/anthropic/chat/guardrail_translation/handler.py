@@ -64,12 +64,25 @@ if TYPE_CHECKING:
 # written back — today that is extended-thinking prose, which Anthropic rejects if it comes
 # back altered by a single byte.
 #
-# 🔴 The explicit sentinel check in both write-backs is LOAD-BEARING, not a second line of
-# defence. An earlier version of this comment claimed the `type == "text"` gate made a
+# 🔴 The explicit sentinel check in the OUTPUT write-back is LOAD-BEARING, not a second line
+# of defence. An earlier version of this comment claimed the `type == "text"` gate made a
 # mis-index harmless; an adversarial review refuted that by execution and was right. With
 # `thinking` FIRST and a text block LAST, `-1` resolves to that text block, whose type IS
 # "text" — so the type gate permits the write and the thinking scan's verdict overwrites
-# the real answer. Removing either guard is a live corruption, not a tidy-up.
+# the real answer. Removing the guard is a live corruption, not a tidy-up.
+#
+# 🔴 **Correction 2026-08-10.** This note said "both write-backs" and claimed both
+# "bounds-check with `>= len(content)`". A code review checked and neither is true: there is
+# exactly ONE sentinel check, in `_apply_guardrail_responses_to_output`. The INPUT write-back
+# `_apply_guardrail_responses_to_input` has no sentinel check AND no bounds check — it
+# assigns straight into `messages[msg_idx]["content"][content_idx]["text"]`.
+#
+# Not a live bug, for one reason only: the input extractor never emits this sentinel, because
+# it keys on `content_item.get("text")` and a thinking block has no `text` key. So the value
+# cannot reach that path today. But the comment was attributing a safety property to a
+# function that does not have it — and anyone adding a third write-back, or making the input
+# extractor emit a sentinel, would inherit a silent corruption on the strength of this note.
+# ⚠️ If the input path ever needs to scan unwritable content, it needs its own guard first.
 #
 # ⚠️ Pinned by `test_the_thinking_verdict_cannot_reach_an_unmapped_trailing_text_block`.
 # An earlier version of this comment credited
@@ -759,13 +772,38 @@ class AnthropicMessagesHandler(BaseTranslation):
 
         has_ended = self._check_streaming_has_ended(responses_so_far)
 
-        # [ARC-BUG-50] Make the skip AUDIBLE. When this returns False the output scan does
-        # not run at all, and on prd-ai that is the only output scan a streaming request
-        # gets (`streaming_end_of_stream_only: true` plus `noma-during-call` off). Before
-        # this, the sole trace was a WARNING about one unparseable frame — nothing said
-        # "and therefore nothing was scanned", so the failure was invisible in both logs
-        # and metrics. `.error()` deliberately, not `.info()`: prd-ai runs
-        # `LITELLM_LOG=ERROR`, under which an info line does not exist to grep for.
+        # [ARC-BUG-50] Make the degraded path AUDIBLE. `.error()` deliberately, not
+        # `.info()`: prd-ai runs `LITELLM_LOG=ERROR`, under which an info line does not
+        # exist to grep for.
+        #
+        # 🔴 **Correction 2026-08-10.** This comment and this message previously said the
+        # output scan "does not run at all" and that the response "was returned unscanned".
+        # Both are WRONG, and a code review caught it by reading the fall-through below:
+        # when `has_ended` is False, control reaches the tail of this method and DOES call
+        # `apply_guardrail` on `get_streaming_string_so_far(...)`. That fall-through predates
+        # this bundle. Anyone who greps this line for a scan that never happened will hunt a
+        # ghost, which is exactly the failure this line was added to prevent.
+        #
+        # What is ACTUALLY lost when `has_ended` is False — three real degradations:
+        #   1. ENFORCEMENT. `_check_streaming_has_ended` is also the withhold trigger in
+        #      `unified_guardrail.py`: once True, trailing chunks are held in
+        #      `pending_end_of_stream_items` and released only after moderation passes, and
+        #      on a block they are never released. False means nothing is withheld, so the
+        #      tail ships before the scan can gate it. A blocking guardrail silently
+        #      degrades to detect-only for that request.
+        #   2. TOOL CALLS. Only the assembled branch scans `tool_calls`; the fall-through
+        #      builds `{"texts": [...]}` and scans text only.
+        #   3. The assembled `ModelResponse` is never built, so anything downstream reading
+        #      it gets the usage-only reconstruction instead.
+        #
+        # ⚠️ Accepting `message_stop` makes `has_ended` True more often, which routes MORE
+        # streams into the assembled branch — and that branch still has one genuinely silent
+        # exit: `verbose_proxy_logger.debug("Skipping output guardrail - model response has
+        # no choices")`. That is a real unscanned response logged at DEBUG, i.e. invisible
+        # under `LITELLM_LOG=ERROR`. Deliberately NOT promoted here: it is a pre-existing
+        # branch on a different failure (a response that assembled but carried no choices),
+        # and widening this commit to cover it would ship an untested change to the path
+        # every successful stream now takes. Recorded as a follow-up rather than smuggled in.
         #
         # ⚠️ Rate-limited to ONE line per request, because this method is called once per
         # SAMPLED CHUNK on one of its two call paths — `unified_guardrail.py:988` invokes it
@@ -793,10 +831,13 @@ class AnthropicMessagesHandler(BaseTranslation):
             if isinstance(request_data, dict):
                 request_data[skip_marker] = True
             verbose_proxy_logger.error(
-                "Guardrail output scan SKIPPED: no end-of-stream signal found in %d "
+                "Guardrail output scan DEGRADED: no end-of-stream signal found in %d "
                 "chunk(s) for guardrail=%s. Neither a message_delta with a non-null "
-                "stop_reason nor a message_stop was parsed, so the response was returned "
-                "unscanned. Logged once per request — one call path runs per sampled chunk.",
+                "stop_reason nor a message_stop was parsed, so the response was NOT "
+                "assembled: the scan still ran on the text-only fall-through, but "
+                "tool_calls were not scanned and the trailing chunks were not withheld, "
+                "so a block could not gate them. Logged once per request — one call path "
+                "runs per sampled chunk.",
                 len(responses_so_far),
                 getattr(guardrail_to_apply, "guardrail_name", "unknown"),
             )
@@ -903,9 +944,16 @@ class AnthropicMessagesHandler(BaseTranslation):
                 if hasattr(content_block, "model_dump"):
                     block_dict = content_block.model_dump()
                 else:
+                    # [ARC-BUG-49] `thinking` must be carried across too. This fallback used
+                    # to build `{"type": ..., "text": ...}` only, so a `thinking` object with
+                    # no `model_dump` was DISPATCHED by the widened gate below and then found
+                    # `thinking = None` at extraction — a silent no-op of this whole fix.
+                    # Measured: the same block as a dict scans, as a plain object it did not.
+                    # Every test used dicts, so nothing covered it.
                     block_dict = {
                         "type": block_type,
                         "text": getattr(content_block, "text", None),
+                        "thinking": getattr(content_block, "thinking", None),
                     }
             else:
                 continue
@@ -1271,7 +1319,39 @@ class AnthropicMessagesHandler(BaseTranslation):
         Apply guardrail responses back to output response.
 
         Override this method to customize how responses are applied.
+
+        🔴 The write-back is POSITIONAL: response N is written to the block named by mapping
+        N. That only holds while the guardrail returns exactly as many texts as it was sent,
+        and nothing guarantees it does — Noma's `_apply_action` replaces `texts` wholesale
+        with whatever the API returned. Measured on the unguarded loop:
+
+          - FEWER texts than mappings: every subsequent verdict shifts up by one, so the
+            verdict for the SECOND answer was written onto the FIRST. Silent, and the output
+            looks plausible — the worst possible failure for a guardrail.
+          - MORE texts than mappings: `IndexError`, i.e. a 500 on a request the guardrail
+            actually approved.
+
+        ARC-BUG-49 increased this exposure rather than creating it: `texts_to_check` now
+        carries a thinking entry that a guardrail may legitimately not echo back, so a count
+        mismatch became reachable on ordinary traffic instead of only on a misbehaving vendor.
+
+        A mismatch means the correspondence this loop depends on is GONE — there is no way to
+        tell which verdict belongs to which block. So the whole write-back is declined rather
+        than applied partially or shifted: leaving the response unmodified is a scan that did
+        not take effect, which is bad; writing a verdict onto the wrong block publishes an
+        answer nobody generated, which is worse. Logged at ERROR so the fail-safe cannot be
+        mistaken for a clean scan.
         """
+        if len(responses) != len(task_mappings):
+            verbose_proxy_logger.error(
+                "Guardrail output write-back DECLINED: the guardrail returned %d texts for %d "
+                "scanned segments, so no verdict can be matched to its content block. The "
+                "response is returned UNMODIFIED — the scan ran but could not be applied.",
+                len(responses),
+                len(task_mappings),
+            )
+            return
+
         for task_idx, guardrail_response in enumerate(responses):
             mapping = task_mappings[task_idx]
             content_idx = cast(int, mapping[0])
