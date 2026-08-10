@@ -555,6 +555,60 @@ def _extract_response_text(response: Any) -> str:
 _PROVIDER_SPECIFIC_KEYS = frozenset({"provider_specific_fields"})
 
 
+def _drop_illegal_system_turns(messages: list[dict]) -> list[dict]:
+    """Remove ``role: "system"`` turns that appending to the array would make illegal.
+
+    [ARC-BUG-54] Anthropic's `/v1/messages` accepts an in-array system turn only when it
+    "must precede an 'assistant' message or end the array". `_build_advisor_context()`
+    APPENDS to the caller's message list, so a system turn that ended the array — legal on
+    the way in — stops being last and the sub-call is rejected with
+
+        messages.N: role 'system' must precede an 'assistant' message or end the array
+
+    Observed live on dev-ai 2026-08-10 15:11:54Z: `messages.110`, raised from
+    `advisor.py:229 → _call_messages_handler:639`, i.e. the advisor orchestration DID run
+    and its sub-call failed. The whole request 400s, so the user loses the executor's
+    answer too — a mid-conversation system turn makes the advisor unusable rather than
+    merely unadvised.
+
+    ⚠️ Dropped, not relocated. Three alternatives were rejected:
+
+      - Hoisting the directives into the top-level `system` parameter changes their
+        POSITION in the conversation, and a mid-conversation directive is positional by
+        construction ("from here on, ...") — silently re-scoping it to the whole
+        conversation would alter the advisor's instructions rather than preserve them.
+      - Rewriting them to `role: "user"` puts words in the user's mouth; the advisor would
+        attribute a system directive to the person it is advising.
+      - Leaving them and letting the 400 through is what happens today.
+
+    This is the ADVISOR SUB-CALL ONLY. The executor call still receives the caller's
+    messages verbatim, so the directive keeps acting on the answer the user actually gets.
+    The advisor sees the conversation minus any directive whose position cannot survive an
+    append — strictly better than seeing nothing because the request failed.
+
+    A turn that legally precedes an assistant turn is KEPT: appending never changes what
+    follows an interior element, so it stays legal.
+    """
+    kept: list[dict] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "system":
+            kept.append(message)
+            continue
+        following = messages[index + 1] if index + 1 < len(messages) else None
+        follows_assistant = isinstance(following, dict) and following.get("role") == "assistant"
+        if follows_assistant:
+            kept.append(message)
+            continue
+        verbose_logger.warning(
+            "[ARC-BUG-54] Dropping messages[%d] (role=system) from the ADVISOR sub-call "
+            "only: appending the advisor question would leave it neither last nor before "
+            "an assistant turn, which Anthropic rejects with a 400 that fails the whole "
+            "request. The executor call is unaffected and still receives it.",
+            index,
+        )
+    return kept
+
+
 def _build_advisor_context(
     messages: List[Dict],
     executor_response: Any,
@@ -569,6 +623,8 @@ def _build_advisor_context(
     tool_use blocks are excluded because Anthropic requires tool_use to be
     immediately followed by tool_result — not the advisor question.
 
+    [ARC-BUG-54] System turns whose legality depends on being last are dropped first —
+    appending below is exactly what invalidates them. See `_drop_illegal_system_turns`.
     """
     question = (advisor_use_block.get("input") or {}).get("question") or (
         "Please provide guidance on the current task."
@@ -580,7 +636,7 @@ def _build_advisor_context(
         for block in raw_content
         if isinstance(block, dict) and block.get("type") == "text"
     ]
-    result = list(messages)
+    result = _drop_illegal_system_turns(messages)
     if executor_text_blocks:
         result.append({"role": "assistant", "content": executor_text_blocks})
     result.append({"role": "user", "content": question})
