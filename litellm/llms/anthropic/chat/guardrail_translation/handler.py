@@ -739,6 +739,23 @@ class AnthropicMessagesHandler(BaseTranslation):
         from litellm.integrations.custom_guardrail import ModifyResponseException
 
         has_ended = self._check_streaming_has_ended(responses_so_far)
+
+        # [ARC-BUG-50] Make the skip AUDIBLE. When this returns False the output scan does
+        # not run at all, and on prd-ai that is the only output scan a streaming request
+        # gets (`streaming_end_of_stream_only: true` plus `noma-during-call` off). Before
+        # this, the sole trace was a WARNING about one unparseable frame — nothing said
+        # "and therefore nothing was scanned", so the failure was invisible in both logs
+        # and metrics. `.error()` deliberately, not `.info()`: prd-ai runs
+        # `LITELLM_LOG=ERROR`, under which an info line does not exist to grep for.
+        if not has_ended and responses_so_far:
+            verbose_proxy_logger.error(
+                "Guardrail output scan SKIPPED: no end-of-stream signal found in %d chunk(s) "
+                "for guardrail=%s. Neither a message_delta with a non-null stop_reason nor a "
+                "message_stop was parsed, so the response was returned unscanned.",
+                len(responses_so_far),
+                getattr(guardrail_to_apply, "guardrail_name", "unknown"),
+            )
+
         if has_ended:
             # build the model response from the responses_so_far
             built_response = AnthropicPassthroughLoggingHandler._build_complete_streaming_response(
@@ -905,13 +922,17 @@ class AnthropicMessagesHandler(BaseTranslation):
                 }
             }
         """
-        text_so_far = ""
+        # [ARC-BUG-50] Join the byte chunks before parsing, for the same reason as
+        # `_check_streaming_has_ended`: this used to call `_extract_text_from_sse` once
+        # PER CHUNK, so a `content_block_delta` split across a transport boundary failed
+        # `json.loads` and its text was silently dropped from the scan payload. The
+        # guardrail then scored a response with a hole in it — worse than not scanning,
+        # because the result looks authoritative.
+        text_so_far = self._extract_text_from_sse(self._join_sse_chunks(responses_so_far).encode("utf-8"))
+
         for response in responses_so_far:
-            # Handle raw bytes in SSE format
-            if isinstance(response, bytes):
-                text_so_far += self._extract_text_from_sse(response)
             # Handle already-parsed dict format
-            elif isinstance(response, dict):
+            if isinstance(response, dict):
                 delta = response.get("delta") if response.get("delta") else None
                 if delta and delta.get("type") == "text_delta":
                     text = delta.get("text", "")
@@ -990,52 +1011,105 @@ class AnthropicMessagesHandler(BaseTranslation):
         Returns:
             True if stop_reason is set to a non-null value, indicating stream has ended
         """
+        # [ARC-BUG-50] Join the byte chunks BEFORE splitting into events.
+        #
+        # This used to decode → split → json.loads per raw transport chunk, with no
+        # buffering across them. A `message_delta` split across a chunk boundary — which
+        # the network is free to do anywhere — failed `json.loads`, logged a warning, and
+        # was skipped. Since a non-null `stop_reason` on `message_delta` was the ONLY
+        # accepted end-of-stream signal, one split frame made this return False for the
+        # whole stream, and `process_output_streaming_response` then never reached
+        # `apply_guardrail`: the output scan was skipped with no error and no metric.
+        #
+        # ⚠️ Consequential on prd-ai specifically, because `noma-post-call` runs
+        # `streaming_end_of_stream_only: true` and `noma-during-call` is `default_on:
+        # false` (config-decisions.md C1) — so a streaming request gets exactly ONE
+        # output scan, at end of stream. That single scan is what a split frame removed,
+        # and every guardrail is monitor_mode / block_failures:false, so it failed
+        # silently by design.
+        #
+        # Attribution: `git blame` puts the unbuffered loop on upstream PR #17619, not on
+        # an Arcadia commit.
+        joined_sse = self._join_sse_chunks(responses_so_far)
+        if joined_sse and self._sse_signals_end_of_stream(joined_sse):
+            return True
+
+        # Handle already-parsed dict format
         for response in responses_so_far:
-            # Handle raw bytes in SSE format
-            if isinstance(response, bytes):
-                try:
-                    # Decode bytes to string
-                    sse_string = response.decode("utf-8")
-
-                    # Split by double newline to get individual events
-                    events = sse_string.split("\n\n")
-
-                    for event in events:
-                        if not event.strip():
-                            continue
-
-                        # Parse event lines
-                        lines = event.strip().split("\n")
-                        event_type = None
-                        data_line = None
-
-                        for line in lines:
-                            if line.startswith("event:"):
-                                event_type = line[6:].strip()
-                            elif line.startswith("data:"):
-                                data_line = line[5:].strip()
-
-                        # Check for message_delta event with stop_reason
-                        if event_type == "message_delta" and data_line:
-                            try:
-                                data = json.loads(data_line)
-                                delta = data.get("delta", {})
-                                stop_reason = delta.get("stop_reason")
-                                if stop_reason is not None:
-                                    return True
-                            except json.JSONDecodeError:
-                                verbose_proxy_logger.warning(f"Failed to parse JSON from SSE data: {data_line}")
-
-                except Exception as e:
-                    verbose_proxy_logger.error(f"Error checking streaming end in SSE: {e}")
-
-            # Handle already-parsed dict format
-            elif isinstance(response, dict):
-                if response.get("type") == "message_delta":
+            if isinstance(response, dict):
+                response_type = response.get("type")
+                if response_type == "message_delta":
                     delta = response.get("delta", {})
-                    stop_reason = delta.get("stop_reason")
-                    if stop_reason is not None:
+                    if delta.get("stop_reason") is not None:
                         return True
+                # [ARC-BUG-50] `message_stop` is a second, independent end-of-stream
+                # signal — see `_sse_signals_end_of_stream`.
+                elif response_type == "message_stop":
+                    return True
+
+        return False
+
+    @staticmethod
+    def _join_sse_chunks(responses_so_far: Sequence[Any]) -> str:
+        """Concatenate the raw byte chunks into one SSE string.
+
+        [ARC-BUG-50] Decoded with ``errors="ignore"`` deliberately: a multi-byte UTF-8
+        character can itself straddle a chunk boundary, and raising there would recreate
+        the very failure this fix removes. The bytes are joined FIRST and decoded once, so
+        a split character is whole by the time it is decoded — the ignore is a backstop for
+        a genuinely truncated tail, not the normal path.
+        """
+        chunks = [chunk for chunk in responses_so_far if isinstance(chunk, bytes)]
+        if not chunks:
+            return ""
+        try:
+            return b"".join(chunks).decode("utf-8", errors="ignore")
+        except Exception as exc:  # pragma: no cover - defensive
+            verbose_proxy_logger.error(f"Error joining SSE chunks: {exc}")
+            return ""
+
+    @staticmethod
+    def _sse_signals_end_of_stream(joined_sse: str) -> bool:
+        """Does this SSE text carry an end-of-stream signal?
+
+        [ARC-BUG-50] TWO signals are accepted, not one:
+
+        * ``message_delta`` with a non-null ``stop_reason`` — the original check;
+        * ``message_stop`` — which Anthropic always sends last.
+
+        Accepting only the first made a single unparseable frame suppress the whole
+        stream's output scan. With the fallback, a malformed ``message_delta`` costs the
+        `stop_reason` detail but no longer costs the scan.
+
+        A parse failure is logged at WARNING and skipped rather than raised: this runs on
+        provider output, and a raise here would fail the request instead of the check.
+        """
+        for event in joined_sse.split("\n\n"):
+            if not event.strip():
+                continue
+
+            event_type = None
+            data_line = None
+            for line in event.strip().split("\n"):
+                if line.startswith("event:"):
+                    event_type = line[6:].strip()
+                elif line.startswith("data:"):
+                    data_line = line[5:].strip()
+
+            if event_type == "message_stop":
+                return True
+
+            if event_type == "message_delta" and data_line:
+                try:
+                    delta = json.loads(data_line).get("delta", {})
+                except json.JSONDecodeError:
+                    # Still reachable: a truncated FINAL frame has no later bytes to be
+                    # joined with. It no longer suppresses the scan, because message_stop
+                    # is accepted above and the caller falls back to it.
+                    verbose_proxy_logger.warning(f"Failed to parse JSON from SSE data: {data_line}")
+                    continue
+                if isinstance(delta, dict) and delta.get("stop_reason") is not None:
+                    return True
 
         return False
 
