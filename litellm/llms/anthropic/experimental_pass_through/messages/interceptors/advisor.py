@@ -625,16 +625,49 @@ def _build_advisor_context(
 
     [ARC-BUG-54] System turns whose legality depends on being last are dropped first —
     appending below is exactly what invalidates them. See `_drop_illegal_system_turns`.
+
+    [ARC-BUG-56] The executor's `thinking` / `redacted_thinking` blocks are carried across
+    with its text. This is the fix for prd-ai's highest-volume client-visible error:
+
+        messages.N.content.M: `thinking` or `redacted_thinking` blocks in the latest
+        assistant message cannot be modified. These blocks must remain as they were in
+        the original response.
+
+    304 alerts 2026-08-05 11:56Z → 2026-08-10 17:15Z, prd-ai only, still firing. Diagnosed
+    from the S3 request logs: in 3 of 3 failing records the LATEST assistant turn was
+    `['text']` while reasoning blocks existed earlier in the history, and `advisor` was
+    present in the request. In 4 of 4 successful thinking-replay records the latest
+    assistant turn was `['thinking', ...]` and `advisor` was ABSENT. The reasoning-turn
+    indices matched the assistant-turn indices exactly on success and diverged on failure.
+
+    Mechanism: this function used to keep ONLY `type == "text"` blocks, so an
+    extended-thinking executor response `['thinking', 'text']` became `['text']`. Anthropic
+    validates the latest assistant message against what it actually returned, so a dropped
+    reasoning block IS a modification — and the whole request 400s, losing the executor's
+    answer as well.
+
+    ⚠️ Reasoning blocks are copied VERBATIM, minus only `_PROVIDER_SPECIFIC_KEYS`. They must
+    not be reordered, merged, or have fields added: `signature` is what Anthropic verifies.
+    Order within the turn is preserved for the same reason.
+
+    ⚠️ `tool_use` / `server_tool_use` stay excluded, and that exclusion is now the ONLY
+    block-set change this function makes. It is required for a different Anthropic rule —
+    a `tool_use` must be followed immediately by its `tool_result`, not by the advisor
+    question. Dropping a `tool_use` from the latest turn can therefore still trip the same
+    400. Not fixed here because the two rules are in direct conflict on that shape and
+    resolving it needs its own change; recorded so the remaining exposure is known rather
+    than assumed closed.
     """
     question = (advisor_use_block.get("input") or {}).get("question") or (
         "Please provide guidance on the current task."
     )
     raw_content = (executor_response.get("content") if isinstance(executor_response, dict) else []) or []
-    # Keep only text blocks — strip tool_use and provider-specific fields.
+    # Keep text AND reasoning blocks; strip tool_use and provider-specific fields.
+    carried_types = ("text", "thinking", "redacted_thinking")
     executor_text_blocks = [
         {k: v for k, v in block.items() if k not in _PROVIDER_SPECIFIC_KEYS}
         for block in raw_content
-        if isinstance(block, dict) and block.get("type") == "text"
+        if isinstance(block, dict) and block.get("type") in carried_types
     ]
     result = _drop_illegal_system_turns(messages)
     if executor_text_blocks:
