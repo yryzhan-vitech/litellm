@@ -198,3 +198,36 @@ def test_an_undecodable_chunk_does_not_lose_the_text_before_it(handler):
     truncated_tail = TEXT_DELTA + "🎉".encode()[:2]  # two of four bytes
 
     assert handler.get_streaming_string_so_far([truncated_tail]) == "SENSITIVE PHRASE"
+
+
+def test_the_skip_marker_is_logged_at_error_so_it_cannot_be_gated_away():
+    """The skip log's LEVEL is part of the fix, and nothing else pins it.
+
+    An adversarial review pointed out that a future edit "helpfully" downgrading this
+    `.error()` to `.warning()` would pass every other test in this file — while making the
+    marker droppable by a bare `LITELLM_LOG=ERROR` handler. That is not hypothetical: the
+    ARC-BUG-53 decline log was written at `.warning()` on exactly that mistaken reasoning,
+    and only survives because `json_logs: true` happens to reset the handler level.
+
+    Asserted against the source rather than by executing the branch, because reaching the
+    branch requires a full streaming guardrail fixture while the property under test is
+    simply "this call site is at ERROR". A source assertion cannot pass for the wrong
+    reason here: there is exactly one such call site.
+    """
+    import inspect
+
+    from litellm.llms.anthropic.chat.guardrail_translation import handler as handler_module
+
+    source = inspect.getsource(handler_module)
+    marker = "Guardrail output scan SKIPPED"
+
+    assert source.count(marker) == 1, "more than one skip-log site — update this test"
+
+    # Walk back from the message to the logger call that carries it.
+    preamble = source[: source.index(marker)]
+    call = preamble[preamble.rindex("verbose_proxy_logger") :]
+
+    assert call.startswith("verbose_proxy_logger.error("), (
+        f"the skip marker must be logged at ERROR, found: {call.splitlines()[0]!r}. "
+        "A WARNING here is droppable by a LITELLM_LOG=ERROR handler when json_logs is off."
+    )

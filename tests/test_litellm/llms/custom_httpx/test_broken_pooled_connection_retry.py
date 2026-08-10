@@ -313,7 +313,16 @@ class TestPostRetriesInPlace:
 
     @pytest.mark.asyncio
     async def test_a_second_broken_connection_is_not_retried_again(self, monkeypatch):
-        """Retried ONCE. A retry loop on a persistently dead pool is an outage amplifier."""
+        """Retried ONCE. A retry loop on a persistently dead pool is an outage amplifier.
+
+        ⚠️ This test hands the mock an already-correct ``litellm.Timeout`` and then checks
+        that a ``litellm.Timeout`` comes back, so it proves only the retry COUNT. It
+        structurally cannot see the exception SHAPE, because it never runs the real
+        ``single_connection_post_request``. An adversarial review used exactly that blind
+        spot to find a leak this file thought it covered — see
+        ``test_a_second_timeout_is_still_reported_as_litellm_Timeout`` below, which drives
+        the real method.
+        """
         from unittest.mock import AsyncMock, MagicMock
 
         import litellm
@@ -334,6 +343,134 @@ class TestPostRetriesInPlace:
                 timeout=10.0,
                 retry_on_broken_pooled_connection=True,
             )
+
+    @pytest.mark.asyncio
+    async def test_a_second_timeout_is_still_reported_as_litellm_Timeout(self, monkeypatch):
+        """🔴 The retry's OWN failure must not escape as a raw ``httpx`` exception.
+
+        ``single_connection_post_request`` has no exception handling of its own, and the
+        retry was originally wrapped in ``try/finally`` — which closes the fresh client and
+        then re-raises whatever came out. So a retry that also timed out propagated a raw
+        ``httpx.ReadTimeout`` out of ``post()``: the one shape no upstream retry, fallback
+        or cooldown layer matches on, turning a classified timeout into an unhandled 500.
+
+        Found by an adversarial review, reproduced before fixing, and pinned here.
+
+        The retry client is driven through the REAL ``single_connection_post_request`` —
+        mocking that method is precisely what hid this — so the exception type this
+        assertion sees is the one production would raise.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        import litellm
+
+        handler = self._handler([_timeout_exc(aiohttp.SocketTimeoutError)])
+
+        # A fresh client whose send() ALSO times out, unmapped — no litellm typing.
+        retry_client = MagicMock()
+        retry_client.build_request = MagicMock(return_value=MagicMock())
+        retry_client.send = AsyncMock(side_effect=httpx.ReadTimeout("the retry timed out too"))
+        retry_client.aclose = AsyncMock()
+        monkeypatch.setattr(handler, "create_client", MagicMock(return_value=retry_client))
+
+        with pytest.raises(litellm.Timeout) as raised:
+            await handler.post(
+                url="https://example.invalid/scan",
+                json={"a": 1},
+                timeout=10.0,
+                retry_on_broken_pooled_connection=True,
+            )
+
+        assert "Timeout passed=" in str(raised.value), "not the shared litellm.Timeout shape"
+        assert retry_client.send.await_count == 1, "the real retry path never ran"
+        assert retry_client.aclose.await_count == 1, "the fresh client leaked"
+
+    @pytest.mark.asyncio
+    async def test_a_non_timeout_failure_on_the_retry_is_not_swallowed(self, monkeypatch):
+        """The new ``except`` arm must catch ONLY timeouts.
+
+        A ``ConnectError`` on the retry is a different fault with a different remedy;
+        relabelling it ``litellm.Timeout`` would send a caller chasing a deadline that
+        never expired. Without this test the fix could be widened to a bare ``except``
+        and every test above would still pass.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        handler = self._handler([_timeout_exc(aiohttp.SocketTimeoutError)])
+
+        retry_client = MagicMock()
+        retry_client.build_request = MagicMock(return_value=MagicMock())
+        retry_client.send = AsyncMock(side_effect=httpx.ConnectError("dns is gone"))
+        retry_client.aclose = AsyncMock()
+        monkeypatch.setattr(handler, "create_client", MagicMock(return_value=retry_client))
+
+        with pytest.raises(httpx.ConnectError):
+            await handler.post(
+                url="https://example.invalid/scan",
+                json={"a": 1},
+                timeout=10.0,
+                retry_on_broken_pooled_connection=True,
+            )
+
+        assert retry_client.aclose.await_count == 1, "the fresh client leaked on the error path"
+
+    @pytest.mark.asyncio
+    async def test_the_reported_elapsed_covers_both_attempts(self, monkeypatch):
+        """The ``litellm.Timeout`` must report the wall time the CALLER actually waited.
+
+        Reporting only the first attempt's elapsed would understate it — and that number
+        feeds the very elapsed-vs-budget classification this fix exists to keep honest, so
+        an understated value could make a real deadline expiry look like a dead connection.
+
+        The clock is patched on the stdlib ``time`` module, because ``http_handler`` does
+        ``import time`` and resolves the attribute at call time. Patching an attribute on
+        the handler's own module does nothing — a mutant survived for exactly that reason.
+
+        ⚠️ The per-read tick must stay well under ``budget × 0.05`` (here 10.0 × 0.05 =
+        0.5s), or the first attempt's own elapsed fails the broken-connection gate, the
+        retry never fires, and the test passes for the wrong reason. Drafted at 0.5s and
+        caught by this assertion — kept as a warning.
+        """
+        import time as _time_module
+        from unittest.mock import AsyncMock, MagicMock
+
+        import litellm
+
+        # post() reads the clock several times; a fixed-length iterator raises
+        # StopIteration mid-call, which asyncio re-labels as RuntimeError. A monotonic
+        # generator keeps advancing however many reads the implementation makes.
+        tick = 0.01
+        state = {"t": 1000.0}
+
+        def fake_time():
+            state["t"] += tick
+            return state["t"]
+
+        monkeypatch.setattr(_time_module, "time", fake_time)
+
+        handler = self._handler([_timeout_exc(aiohttp.SocketTimeoutError)])
+        retry_client = MagicMock()
+        retry_client.build_request = MagicMock(return_value=MagicMock())
+        retry_client.send = AsyncMock(side_effect=httpx.ReadTimeout("also timed out"))
+        retry_client.aclose = AsyncMock()
+        monkeypatch.setattr(handler, "create_client", MagicMock(return_value=retry_client))
+
+        with pytest.raises(litellm.Timeout) as raised:
+            await handler.post(
+                url="https://example.invalid/scan",
+                json={"a": 1},
+                timeout=10.0,
+                retry_on_broken_pooled_connection=True,
+            )
+
+        assert retry_client.send.await_count == 1, "the retry never fired — tick too large?"
+
+        # The single-attempt path reads the clock twice (start, end). Re-measuring after the
+        # retry adds at least one more read, so the reported elapsed must exceed 2 ticks.
+        message = str(raised.value)
+        assert "time taken=" in message
+        taken = float(message.split("time taken=")[1].split(" ")[0])
+        assert taken > 2 * tick, f"elapsed {taken} covers only the first attempt"
 
     @pytest.mark.asyncio
     async def test_the_retry_is_OFF_by_default(self, monkeypatch):

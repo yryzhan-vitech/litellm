@@ -71,6 +71,16 @@ if TYPE_CHECKING:
 # "text" — so the type gate permits the write and the thinking scan's verdict overwrites
 # the real answer. Removing either guard is a live corruption, not a tidy-up.
 #
+# ⚠️ Pinned by `test_the_thinking_verdict_cannot_reach_an_unmapped_trailing_text_block`.
+# An earlier version of this comment credited
+# `test_the_thinking_response_does_not_land_on_a_trailing_text_block` instead — WRONG, and
+# a second review caught it: that test's trailing block has real text, so it earns its own
+# mapping whose later write overwrites the corruption, and the test passes with the guard
+# neutered. Verified by mutation: neutering the guard left all 13 tests in that file green.
+# The killing shape is a trailing text block that earns NO mapping of its own — empty
+# `text`, a missing `text` key, or `text: None`, all of which Anthropic emits in practice
+# alongside `tool_use`.
+#
 # -1 rather than a large number because both write-backs bounds-check with
 # `>= len(content)`, which a negative index passes silently.
 _UNWRITABLE_CONTENT_IDX = -1
@@ -756,11 +766,37 @@ class AnthropicMessagesHandler(BaseTranslation):
         # "and therefore nothing was scanned", so the failure was invisible in both logs
         # and metrics. `.error()` deliberately, not `.info()`: prd-ai runs
         # `LITELLM_LOG=ERROR`, under which an info line does not exist to grep for.
-        if not has_ended and responses_so_far:
+        #
+        # ⚠️ Rate-limited to ONE line per request, because this method is called once per
+        # SAMPLED CHUNK on one of its two call paths — `unified_guardrail.py:988` invokes it
+        # from the iterator hook with a growing `responses_so_far`. Measured by an
+        # adversarial review: an 805-chunk stream emitted 803 ERROR lines for a single
+        # request, scaling linearly with response length. That is a log flood presented as
+        # observability, and it would bury the very signal this line exists to surface.
+        #
+        # The other path (`:1069`) fires ONCE with the whole chunk list, and on the current
+        # config it is the only one that runs — `noma-post-call` is the sole hook passing
+        # the iterator's `post_call` gate and it sets `streaming_end_of_stream_only: true`.
+        # So the de-duplication must NOT be keyed on the chunk count: a
+        # `len(responses_so_far) == 1` gate looks like "first call" but would silence
+        # exactly the end-of-stream path that matters, on exactly the config we run. That
+        # was the first attempt here; it is recorded because it reads as obviously correct.
+        #
+        # Keyed on `request_data` instead, which is the same dict object for every call in
+        # one request — this class is re-instantiated per call
+        # (`endpoint_guardrail_translation_mappings[...]()`), so instance state cannot
+        # carry. When `request_data` is None there is nothing to key on, so it logs: a
+        # duplicate line is a smaller failure than a silent unscanned response.
+        skip_marker = "_arc_bug_50_scan_skip_logged"
+        already_logged = isinstance(request_data, dict) and request_data.get(skip_marker)
+        if not has_ended and responses_so_far and not already_logged:
+            if isinstance(request_data, dict):
+                request_data[skip_marker] = True
             verbose_proxy_logger.error(
-                "Guardrail output scan SKIPPED: no end-of-stream signal found in %d chunk(s) "
-                "for guardrail=%s. Neither a message_delta with a non-null stop_reason nor a "
-                "message_stop was parsed, so the response was returned unscanned.",
+                "Guardrail output scan SKIPPED: no end-of-stream signal found in %d "
+                "chunk(s) for guardrail=%s. Neither a message_delta with a non-null "
+                "stop_reason nor a message_stop was parsed, so the response was returned "
+                "unscanned. Logged once per request — one call path runs per sampled chunk.",
                 len(responses_so_far),
                 getattr(guardrail_to_apply, "guardrail_name", "unknown"),
             )
@@ -937,17 +973,37 @@ class AnthropicMessagesHandler(BaseTranslation):
         # `json.loads` and its text was silently dropped from the scan payload. The
         # guardrail then scored a response with a hole in it — worse than not scanning,
         # because the result looks authoritative.
-        text_so_far = self._extract_text_from_sse(self._join_sse_chunks(responses_so_far).encode("utf-8"))
+        #
+        # ⚠️ Byte runs are joined and decoded per CONTIGUOUS RUN, not across the whole
+        # list, so source order survives when both formats are interleaved. Joining every
+        # byte chunk up front and then appending the dicts reorders the text: an
+        # adversarial review measured `[dict"A ", bytes"B ", dict"C"]` coming out as
+        # "B A C". Same characters, scrambled prose — and a guardrail that scores
+        # reordered text returns a verdict about something the user never received.
+        # Inert on today's live path, which appends one format only, but the docstring
+        # above advertises both, so the next caller would inherit the bug.
+        segments: list[str] = []
+        byte_run: list[Any] = []
+
+        def _flush_byte_run() -> None:
+            if byte_run:
+                segments.append(self._extract_text_from_sse(self._join_sse_chunks(byte_run).encode("utf-8")))
+                byte_run.clear()
 
         for response in responses_so_far:
             # Handle already-parsed dict format
             if isinstance(response, dict):
+                _flush_byte_run()
                 delta = response.get("delta") if response.get("delta") else None
                 if delta and delta.get("type") == "text_delta":
                     text = delta.get("text", "")
                     if text:
-                        text_so_far += text
-        return text_so_far
+                        segments.append(text)
+                continue
+            byte_run.append(response)
+        _flush_byte_run()
+
+        return "".join(segments)
 
     def _extract_text_from_sse(self, sse_bytes: bytes) -> str:
         """

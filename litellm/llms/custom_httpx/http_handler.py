@@ -828,6 +828,33 @@ class AsyncHTTPHandler:
                         headers=headers,
                         stream=stream,
                     )
+                except httpx.TimeoutException as retry_exc:
+                    # The retry timed out too. `single_connection_post_request` has no
+                    # exception handling of its own, so without this arm the raw
+                    # `httpx.TimeoutException` escapes `post()` and never becomes a
+                    # `litellm.Timeout` — the one exception type every caller upstream
+                    # matches on. Measured: a second `httpx.ReadTimeout` propagated out
+                    # verbatim, so a retried request failed in a shape no retry/fallback
+                    # layer recognises, turning a classified timeout into an unhandled 500.
+                    # `finally` alone could not close this: it runs the cleanup and then
+                    # re-raises the original.
+                    #
+                    # Fall THROUGH to the shared `litellm.Timeout` raise below rather than
+                    # raising here, so both legs report one shape. `time_delta` is
+                    # deliberately re-measured to cover attempt 1 + attempt 2 — reporting
+                    # only the first attempt's elapsed would understate the real wall time
+                    # a caller waited, and that number feeds the same
+                    # elapsed-vs-budget classification this fix exists to keep honest.
+                    verbose_logger.warning(
+                        "[ARC-BUG-47] The retry on a fresh connection ALSO timed out: %s. "
+                        "url=%s retry_budget=%s — reporting as litellm.Timeout over the "
+                        "combined elapsed time of both attempts.",
+                        type(retry_exc).__name__,
+                        url,
+                        remaining,
+                    )
+                    e = retry_exc
+                    time_delta = time.time() - start_time
                 finally:
                     await new_client.aclose()
 

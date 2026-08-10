@@ -66,11 +66,36 @@ class AdvisorOrchestrationHandler(MessagesInterceptor):
         # for and skipped". The hypothesis was provable as code and unobservable in
         # traffic. This makes the decline greppable.
         #
-        # ⚠️ `.warning()`, not `.info()`: prd-ai runs `LITELLM_LOG=ERROR`, under which an
-        # info line does not exist to grep for at all — the trap that made 142
-        # `grep -i fallback` hits turn out to be stack-frame names rather than events.
-        # WARNING is the lowest level that survives there while staying below ERROR,
-        # because a decline is a routing decision, not a failure.
+        # ⚠️ `.warning()`, not `.info()`: prd-ai and dev-ai both run `LITELLM_LOG=ERROR`,
+        # under which an info line does not exist to grep for at all — the trap that made
+        # 142 `grep -i fallback` hits turn out to be stack-frame names rather than events.
+        #
+        # 🔴 **Correction 2026-08-10.** This note previously justified WARNING as "the
+        # lowest level that survives there while staying below ERROR". That reasoning is
+        # WRONG and would have been fatal on a different config. `_logging.py:86` calls
+        # `handler.setLevel(ERROR)` from `LITELLM_LOG` at import time, and
+        # `proxy_server.py` only calls `.setLevel()` on the LOGGERS for the INFO/DEBUG
+        # branches — so a bare `LITELLM_LOG=ERROR` deployment creates the WARNING record
+        # and then drops it at the handler. Measured: with `LITELLM_LOG=ERROR` alone a
+        # `verbose_logger.warning()` emits ZERO bytes.
+        #
+        # It survives on OUR deployments for an unrelated reason: `litellm_settings`
+        # carries `json_logs: true`, so `proxy_server.py:4718-4720` calls
+        # `litellm._turn_on_json()` → `_initialize_loggers_with_handler()`, which does
+        # `lg.handlers.clear()` and attaches a FRESH handler carrying no level at all
+        # (NOTSET), discarding the ERROR floor. Measured on that exact combination:
+        # handler ERROR(40) → NOTSET(0), and WARNING then emits. Confirmed live — the
+        # dev-ai pods show 82 WARNING records under `LITELLM_LOG=ERROR`.
+        #
+        # ⚠️ So this line's visibility is CONDITIONAL on `json_logs: true`. Turning JSON
+        # logging off anywhere would silence it without touching this file. Pinned by
+        # `test_the_decline_survives_the_deployed_logging_configuration`, which asserts against a
+        # real handler rather than caplog — caplog installs its own capturing handler and
+        # therefore cannot observe this class of suppression at all.
+        #
+        # Deliberately NOT `.error()`: a decline is a routing decision, not a failure, and
+        # ERROR-level noise on a normal path corrupts every error-rate grep and dashboard
+        # this gateway is measured by.
         #
         # ⚠️ Only the DECLINE is logged. Logging every accept would add a line to every
         # advisor request on a proxy that already emits ~1 000 req/pod/h, and the accept
@@ -543,6 +568,7 @@ def _build_advisor_context(
 
     tool_use blocks are excluded because Anthropic requires tool_use to be
     immediately followed by tool_result — not the advisor question.
+
     """
     question = (advisor_use_block.get("input") or {}).get("question") or (
         "Please provide guidance on the current task."

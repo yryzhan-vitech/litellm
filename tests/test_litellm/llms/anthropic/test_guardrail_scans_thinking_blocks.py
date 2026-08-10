@@ -190,8 +190,18 @@ def test_the_thinking_response_does_not_land_on_a_trailing_text_block():
     The shape that exposes it: `thinking` FIRST, a text block LAST. The thinking scan's
     response then overwrites that trailing text — the guardrail's verdict about the
     reasoning gets published as the visible answer, and the real text block's own verdict
-    is lost. A mutation that removes the guard survived every other test in this file,
-    which is why this case is spelled out.
+    is lost.
+
+    🔴 **This test does NOT in fact kill that mutation, and the comment in `handler.py`
+    that cited it was wrong.** Proven by execution: neuter the guard and all 13 tests in
+    this file still pass. The reason is that the trailing block here has non-empty text, so
+    it earns its OWN mapping `(1, None)`; the later write from that mapping overwrites the
+    corruption the sentinel write just made to the same block, and the assertion below sees
+    the correct value. It passes for the wrong reason.
+
+    Kept because the ORDERING property it states is still worth pinning. The mutation is
+    killed by `test_the_thinking_verdict_cannot_reach_an_unmapped_trailing_text_block`
+    below, which uses a trailing block that earns no mapping of its own.
     """
     blocks = [copy.deepcopy(THINKING), {"type": "text", "text": "the trailing answer"}]
     response = {"model": "claude-sonnet-5", "content": blocks}
@@ -226,3 +236,79 @@ def test_redacted_thinking_data_is_never_sent_to_the_guardrail():
 
     assert REDACTED["data"] not in texts, f"the encrypted blob was scanned: {texts}"
     assert texts == [THINKING["thinking"]], f"only the thinking prose should be scanned: {texts}"
+
+
+@pytest.mark.parametrize(
+    "trailing,why",
+    [
+        ({"type": "text", "text": ""}, "empty text earns no mapping"),
+        ({"type": "text"}, "no text key at all"),
+        ({"type": "text", "text": None}, "explicit null text"),
+    ],
+    ids=["empty_string", "missing_key", "null_text"],
+)
+def test_the_thinking_verdict_cannot_reach_an_unmapped_trailing_text_block(trailing, why):
+    """🔴 THE test that kills a neutered sentinel guard. Found by mutation testing.
+
+    `_UNWRITABLE_CONTENT_IDX` is -1, a legal Python index, so without the guard at the
+    write-back the thinking scan's verdict is written to `content[-1]` — the LAST block.
+
+    The pre-existing trailing-text test cannot detect that: its trailing block has real
+    text, so it earns its own mapping whose later write overwrites the damage. Only a
+    trailing text block that earns NO mapping leaves the -1 write observable. Anthropic
+    emits empty trailing text blocks in practice (notably alongside `tool_use`), so this is
+    a reachable shape, not a contrived one.
+
+    What the bug does if it ships: the guardrail's verdict ABOUT THE MODEL'S PRIVATE
+    REASONING is published as the user-visible answer.
+
+    Verified to FAIL against the mutation (guard neutered) and PASS unmutated.
+    """
+    blocks = [copy.deepcopy(THINKING), copy.deepcopy(trailing)]
+    response = {"model": "claude-sonnet-5", "content": blocks}
+
+    texts, mappings = _extract(blocks)
+    assert mappings == [(_UNWRITABLE_CONTENT_IDX, None)], f"precondition ({why}): {mappings}"
+
+    asyncio.run(
+        AnthropicMessagesHandler()._apply_guardrail_responses_to_output(
+            response=response,
+            responses=["[VERDICT-ON-REASONING]"],
+            task_mappings=mappings,
+        )
+    )
+
+    assert blocks[1] == trailing, (
+        f"the reasoning verdict was published into the visible answer ({why}): {blocks[1]}"
+    )
+    assert blocks[0] == THINKING, "the thinking block was modified"
+
+
+def test_the_inner_extractor_alone_refuses_redacted_thinking():
+    """The `redacted_thinking` exclusion is two-gated, and each gate needs its own test.
+
+    Extraction is gated twice — the outer dispatch in `_extract_from_content_blocks` and
+    the `content_type` arm inside `_extract_output_text_and_images`. The existing
+    `redacted_thinking` test drives only the outer path, so EITHER gate alone upholds the
+    property and a single-gate mutation survives. Mutation testing confirmed both
+    single-gate mutants survive the suite.
+
+    It matters because `_extract_output_text_and_images` is documented as an override hook
+    ("Override this method to customize text/image/tool extraction logic") and the sibling
+    OpenAI responses handler calls its own copy with no equivalent outer type gate. A
+    subclass, or a copy of that pattern, would ship server-encrypted ciphertext to a
+    third-party scanner with the suite green.
+    """
+    texts, mappings = [], []
+
+    AnthropicMessagesHandler()._extract_output_text_and_images(
+        content_block=copy.deepcopy(REDACTED),
+        content_idx=0,
+        texts_to_check=texts,
+        images_to_check=[],
+        task_mappings=mappings,
+        tool_calls_to_check=[],
+    )
+
+    assert texts == [], f"the encrypted blob reached the scanner: {texts}"
+    assert mappings == [], f"a mapping was created for an unscannable block: {mappings}"

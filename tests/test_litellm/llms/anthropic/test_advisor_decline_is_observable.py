@@ -99,6 +99,11 @@ def test_the_decline_is_logged_at_warning_not_info(handler, caplog):
     stack-frame names rather than events: the real lines were `.info()` and had been
     suppressed at source. A decline logged at INFO would be equally ungreppable, so the
     level is part of the fix, not a detail.
+
+    ⚠️ This asserts the record's LEVEL only. `caplog` installs its own capturing handler,
+    so it cannot see handler-level suppression at all — see
+    `test_the_decline_survives_the_deployed_logging_configuration`, which drives the real
+    handler and is the test that actually proves greppability.
     """
     caplog.set_level(logging.DEBUG, logger="LiteLLM")
 
@@ -109,6 +114,70 @@ def test_the_decline_is_logged_at_warning_not_info(handler, caplog):
     assert all(r.levelno >= logging.WARNING for r in records), (
         f"the decline must be at WARNING or above to survive LITELLM_LOG=ERROR: {[r.levelname for r in records]}"
     )
+
+
+def test_the_decline_survives_the_deployed_logging_configuration(handler, monkeypatch):
+    """🔴 A WARNING record that reaches no handler is not observability.
+
+    An adversarial review proved, by execution, that under a bare `LITELLM_LOG=ERROR` this
+    line emits ZERO bytes: `_logging.py` calls `handler.setLevel(ERROR)` at import time,
+    and `proxy_server.py` only calls `.setLevel()` on the LOGGERS for the INFO/DEBUG
+    branches. The record is created and then dropped at the handler. The level test above
+    passes anyway, because `caplog` attaches its own handler.
+
+    It survives on our deployments for an unrelated reason: `litellm_settings.json_logs:
+    true` makes `proxy_server.py` call `litellm._turn_on_json()`, whose
+    `_initialize_loggers_with_handler()` does `lg.handlers.clear()` and attaches a fresh
+    handler with NO level — discarding the ERROR floor. Verified live: the dev-ai pods emit
+    WARNING records under `LITELLM_LOG=ERROR`.
+
+    So this pins the CONDITION, not just the level. If JSON logging is ever turned off
+    while `LITELLM_LOG=ERROR` stays, this fails and says why — instead of the decline going
+    quiet in production with every other test still green.
+    """
+    import io
+
+    import litellm
+    from litellm._logging import verbose_logger
+
+    original_handlers = list(verbose_logger.handlers)
+    original_level = verbose_logger.level
+    try:
+        # Reproduce the deployed pair: LITELLM_LOG=ERROR *and* json_logs: true.
+        monkeypatch.setenv("LITELLM_LOG", "ERROR")
+        error_gated = logging.StreamHandler()
+        error_gated.setLevel(logging.ERROR)
+        verbose_logger.handlers = [error_gated]
+        verbose_logger.setLevel(logging.NOTSET)
+
+        # Negative control: with only the ERROR-gated handler the decline is invisible.
+        # Without this, a permanently-visible line would make the assertion below vacuous.
+        suppressed = io.StringIO()
+        error_gated.stream = suppressed
+        handler.can_handle(tools=[ADVISOR_TOOL], custom_llm_provider="anthropic")
+        assert MARKER not in suppressed.getvalue(), (
+            "expected the ERROR-gated handler to drop a WARNING — if this fails the premise "
+            "changed and the comment in advisor.py needs revisiting"
+        )
+
+        # Now apply what the deployment applies; the same call must become visible.
+        litellm._turn_on_json()
+        captured = io.StringIO()
+        for installed in verbose_logger.handlers:
+            if hasattr(installed, "stream"):
+                installed.stream = captured
+
+        handler.can_handle(tools=[ADVISOR_TOOL], custom_llm_provider="anthropic")
+
+        assert MARKER in captured.getvalue(), (
+            "the decline produced no output under the deployed logging configuration "
+            "(LITELLM_LOG=ERROR + json_logs: true) — it is not greppable in production"
+        )
+    finally:
+        # _turn_on_json() mutates module-global loggers, so restore them explicitly;
+        # monkeypatch cannot undo a handlers.clear() performed inside library code.
+        verbose_logger.handlers = original_handlers
+        verbose_logger.setLevel(original_level)
 
 
 def test_a_dated_advisor_tool_variant_still_counts_as_advisor(handler, declines):
